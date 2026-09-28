@@ -1,0 +1,80 @@
+# ---------- Project: data, models, outputs (never commit) ----------
+# Local fallback root used by src/config.py when not on Colab
+local_data/
+
+# Same folders, in case they are created inside the repo
+data/
+proxy_cache/
+cleaned/
+models_ckpt/
+human_validation/
+gold_test/
+results/
+logs/
+scrape_state/
+lexicon/
+
+# Data and artifacts by extension
+*.csv
+*.tsv
+*.npy
+*.npz
+*.pkl
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.bin
+*.h5
+
+# Scraped data / annotation files must stay out of a public repo
+all_reviews_master*
+dataset_manifest.json
+scrape_errors.log
+
+# ---------- Python ----------
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+build/
+dist/
+.eggs/
+
+# ---------- Environments / secrets ----------
+.env
+.envrc
+.venv/
+venv/
+env/
+ENV/
+
+# ---------- Jupyter / Colab ----------
+.ipynb_checkpoints/
+.virtual_documents/
+
+# ---------- Tooling / caches ----------
+.cache/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+*.log
+
+# ---------- Editors / OS ----------
+.vscode/
+.idea/
+tempCodeRunnerFile.py
+.DS_Store
+Thumbs.db
+
+Referensi/
+*.pdf
+*.png
+*.jpg
+*.jpeg
+*.gif
+
+Gambar/
+*.drawio
