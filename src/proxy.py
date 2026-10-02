@@ -1,10 +1,6 @@
 """
-proxy.py -- Implementasi semua proxy classifier (P1-P5) untuk Confident
-Learning. Backbone tunggal (config.PRETRAINED_MODEL_NAME = IndoBERT),
-sesuai Batasan Masalah Bab 1.6 -- TIDAK ADA proxy dengan backbone lain
-(P6/IndoBERTweet dihapus total, lihat config.py).
+proxy.py -- Proxy classifier P1-P4 untuk Confident Learning. Backbone tunggal IndoBERT.
 """
-
 import os
 import numpy as np
 import pandas as pd
@@ -24,14 +20,19 @@ from src.models import IndoBERTStandard, IndoBERTCORN
 from coral_pytorch.losses import corn_loss
 
 
-# ==========================================================
-# CACHE HELPER — dipakai semua metode, supaya tidak recompute
-# ==========================================================
+# ---------------- cache helper ----------------
+def _tagged(path, tag):
+    if not tag:
+        return path
+    root, ext = os.path.splitext(path)
+    return f"{root}__{tag}{ext}"
+
+
 def _load_cache_if_valid(cache_file, meta_file, texts):
     if os.path.exists(cache_file) and os.path.exists(meta_file):
         meta = pd.read_csv(meta_file)
         if meta["text"].tolist() == list(texts):
-            print(f"⚡ Memuat cache proxy [{config.PROXY_NAME}] ...")
+            print(f"⚡ Memuat cache proxy [{config.PROXY_NAME}] ({os.path.basename(cache_file)}) ...")
             return np.load(cache_file)
         print(f"⚠️ Cache proxy [{config.PROXY_NAME}] tidak cocok dgn data saat ini -> recompute.")
     return None
@@ -42,20 +43,10 @@ def _save_cache(cache_file, meta_file, texts, array):
     pd.DataFrame({"text": texts}).to_csv(meta_file, index=False)
 
 
-# ==========================================================
-# EMBEDDING BEKU (dipakai oleh proxy 0 & 1)
-# ==========================================================
-# CATATAN METODOLOGIS: tokenisasi di sini (padding=True, dinamis per-batch)
-# BEDA strategi dengan ReviewDataset yang dipakai P3/P4/P5 (padding="max_length",
-# fixed 128 token). Ini bukan kesalahan -- keduanya valid secara teknis --
-# tapi berarti P1/P2 vs P3/P4/P5 diproses lewat jalur tokenisasi yang tidak
-# identik. Sebutkan ini di Bab III/IV sebagai potential confound minor kalau
-# nanti menganalisis kenapa performa P1/P2 jauh di bawah P3/P4/P5 -- selisih
-# performanya kemungkinan besar didominasi oleh fine-tuning vs frozen
-# embedding, tapi strategi padding yang beda tetap perlu dicatat sebagai
-# variabel yang tidak sepenuhnya dikontrol.
+# ---------------- embedding beku (P1, P2) ----------------
+# CATATAN: padding dinamis per-batch di sini vs padding="max_length" pada ReviewDataset (P3/P4)
+# -> jalur tokenisasi P1/P2 vs P3/P4 tidak identik; sebutkan sebagai confound minor di Bab IV.
 def _get_embeddings(texts, pooling="mean", batch_size=32):
-    """pooling: 'cls' atau 'mean'. Cache mengikuti nama pooling agar tidak tercampur."""
     cache_file = config.EMBEDDING_CACHE_FILE_BASE.replace(".npy", f"_{pooling}.npy")
     meta_file = config.EMBEDDING_CACHE_META_FILE_BASE.replace(".csv", f"_{pooling}.csv")
 
@@ -71,19 +62,15 @@ def _get_embeddings(texts, pooling="mean", batch_size=32):
     with torch.no_grad():
         for i in tqdm(range(0, len(texts), batch_size), desc=f"Embedding ({pooling})"):
             batch_texts = texts[i: i + batch_size]
-            encoded = tokenizer(
-                batch_texts, padding=True, truncation=True,
-                max_length=config.MAX_LEN, return_tensors="pt",
-            ).to(config.DEVICE)
+            encoded = tokenizer(batch_texts, padding=True, truncation=True,
+                                max_length=config.MAX_LEN, return_tensors="pt").to(config.DEVICE)
             outputs = model(**encoded)
-
             if pooling == "cls":
                 emb = outputs.last_hidden_state[:, 0, :]
-            else:  # mean pooling
+            else:
                 token_emb = outputs.last_hidden_state
                 mask = encoded["attention_mask"].unsqueeze(-1).expand(token_emb.size()).float()
                 emb = torch.sum(token_emb * mask, dim=1) / torch.clamp(mask.sum(dim=1), min=1e-9)
-
             embeddings.extend(emb.cpu().numpy())
 
     embeddings = np.array(embeddings)
@@ -91,97 +78,46 @@ def _get_embeddings(texts, pooling="mean", batch_size=32):
     return embeddings
 
 
-# ==========================================================
-# PROXY 0 & 1: embedding beku + Logistic Regression
-# ==========================================================
 def _proxy_frozen_lr(texts, labels, pooling):
-    """
-    PERBAIKAN: cv sebelumnya diberikan sebagai integer (config.PROXY_CV_FOLDS),
-    yang membuat cross_val_predict() default ke StratifiedKFold(shuffle=False)
-    -- karena data kemungkinan terurut per-app dan per-waktu scraping (lihat
-    scrape_google_play.py), fold yang dihasilkan tanpa shuffle berisiko bias
-    secara app/waktu. Sekarang StratifiedKFold dibuat eksplisit dengan
-    shuffle=True, random_state=42 -- IDENTIK dengan skema CV yang dipakai
-    _finetune_kfold_oof (P3/P4/P5), supaya perbandingan lintas proxy di
-    pilot study benar-benar apple-to-apple dari sisi skema validasi silang.
-    """
+    """StratifiedKFold(shuffle=True, random_state=42) eksplisit -- identik dengan P3/P4."""
     X = _get_embeddings(texts, pooling=pooling, batch_size=config.BATCH_SIZE)
     base_clf = LogisticRegression(max_iter=2000, random_state=42)
     calibrated = CalibratedClassifierCV(base_clf, cv=3, method="sigmoid")
-
-    cv_splitter = StratifiedKFold(
-        n_splits=config.PROXY_CV_FOLDS, shuffle=True, random_state=42
-    )
-    return cross_val_predict(
-        calibrated, X, labels, cv=cv_splitter, method="predict_proba", n_jobs=-1
-    )
+    cv_splitter = StratifiedKFold(n_splits=config.PROXY_CV_FOLDS, shuffle=True, random_state=42)
+    return cross_val_predict(calibrated, X, labels, cv=cv_splitter, method="predict_proba", n_jobs=-1)
 
 
-# ==========================================================
-# KONVERSI LOGIT CORN -> PROBABILITAS PENUH (dipakai proxy 3 & 4)
-# ==========================================================
+# ---------------- konversi CORN -> probabilitas kelas (§3.6 butir 3) ----------------
 def _corn_logits_to_probas(logits):
-    """P(y>k) = cumprod sigmoid -> otomatis monoton turun (rank-consistent)."""
     probs_cond = torch.sigmoid(logits)
     cum_probs = torch.cumprod(probs_cond, dim=1)
-
     batch_size, K = logits.shape[0], logits.shape[1] + 1
     class_probs = torch.zeros(batch_size, K, device=logits.device, dtype=logits.dtype)
     class_probs[:, 0] = 1.0 - cum_probs[:, 0]
     for k in range(1, K - 1):
         class_probs[:, k] = cum_probs[:, k - 1] - cum_probs[:, k]
     class_probs[:, K - 1] = cum_probs[:, K - 2]
-
     class_probs = torch.clamp(class_probs, min=1e-8)
     return class_probs / class_probs.sum(dim=1, keepdim=True)
 
 
-# ==========================================================
-# TEMPERATURE SCALING PASCA-FOLD (BARU) — dipakai P3/P4/P5
-# ==========================================================
+# ---------------- temperature scaling (§2.1.8, §3.6 butir 2) ----------------
 def _calibrate_with_temperature(oof_logits, labels_arr, loss_type):
     """
-    P1/P2 sudah dikalibrasi lewat CalibratedClassifierCV (Platt scaling),
-    tapi P3/P4/P5 (fine-tuned) sebelumnya TIDAK dikalibrasi sama sekali --
-    softmax/CORN-probas mentah langsung dipakai sebagai pred_probs untuk
-    Confident Learning, padahal cleanlab (Northcutt dkk., 2021) eksplisit
-    mengasumsikan pred_probs yang sudah well-calibrated untuk estimasi
-    confident joint yang akurat.
-
-    Solusi di sini: temperature scaling (Guo dkk., 2017) -- satu skalar T
-    dicari lewat LBFGS untuk meminimalkan negative log-likelihood terhadap
-    label ASLI (bukan label mayoritas atau proxy lain), dihitung dari OOF
-    logits GABUNGAN seluruh fold (bukan per-fold, supaya estimasi T lebih
-    stabil dan tidak overfit ke satu fold kecil).
-
-    Untuk CE: probs_calibrated = softmax(logits / T)
-    Untuk CORN: probs_calibrated = _corn_logits_to_probas(logits / T)
-    -- generalisasi temperature scaling standar (yang aslinya didefinisikan
-    untuk softmax) ke struktur cumulative-link CORN, dengan membagi logit
-    MENTAH (sebelum sigmoid) dengan T. Ini pilihan desain yang masuk akal
-    (T besar -> distribusi makin rata/kurang percaya diri, T kecil -> makin
-    tajam, konsisten dengan interpretasi T pada softmax), tapi bukan
-    turunan formal dari teori kalibrasi CORN yang sudah divalidasi di
-    literatur -- sebutkan ini eksplisit sebagai keputusan metodologis kalau
-    ditanya penguji, jangan diklaim sebagai "standar baku".
-
-    T awal = 1.0 (tidak ada scaling) -- kalau optimasi gagal konvergen,
-    fallback ke T=1.0 (probs tidak berubah) dengan peringatan di log.
+    Satu skalar T (LBFGS, minimalkan NLL). CE: softmax(z/T). CORN: z/T sebelum sigmoid, satu T
+    dibagikan ke K-1 logit. Fallback T=1.0 jika optimasi gagal.
     """
     logits_t = torch.tensor(oof_logits, dtype=torch.float32)
     labels_t = torch.tensor(labels_arr, dtype=torch.long)
-
     temperature = torch.nn.Parameter(torch.ones(1) * 1.0)
     optimizer = torch.optim.LBFGS([temperature], lr=0.01, max_iter=100)
 
     def _nll_loss(T):
-        T_clamped = torch.clamp(T, min=1e-2)  # cegah pembagian oleh nol/negatif
-        scaled_logits = logits_t / T_clamped
+        scaled = logits_t / torch.clamp(T, min=1e-2)
         if loss_type == "ce":
-            log_probs = F.log_softmax(scaled_logits, dim=1)
-        else:  # corn
-            probs = _corn_logits_to_probas(scaled_logits)
-            log_probs = torch.log(torch.clamp(probs, min=1e-8))
+            log_probs = F.log_softmax(scaled, dim=1)
+        else:
+            log_probs = torch.log(torch.clamp(_corn_logits_to_probas(scaled), min=1e-8))
         return F.nll_loss(log_probs, labels_t)
 
     def closure():
@@ -195,35 +131,24 @@ def _calibrate_with_temperature(oof_logits, labels_arr, loss_type):
         optimizer.step(closure)
         nll_after = _nll_loss(temperature).item()
         T_final = torch.clamp(temperature.detach(), min=1e-2).item()
-        print(f"   🌡️  Temperature scaling [{config.PROXY_NAME}]: T={T_final:.4f} "
-              f"(NLL {nll_before:.4f} -> {nll_after:.4f})")
+        print(f"   🌡️  Temperature scaling [{config.PROXY_NAME}]: T={T_final:.4f} (NLL {nll_before:.4f} -> {nll_after:.4f})")
     except Exception as e:
-        print(f"   ⚠️ Temperature scaling gagal konvergen ({e}) -- fallback T=1.0 (tanpa scaling).")
+        print(f"   ⚠️ Temperature scaling gagal konvergen ({e}) -- fallback T=1.0.")
         T_final = 1.0
 
     with torch.no_grad():
-        scaled_logits = logits_t / T_final
-        if loss_type == "ce":
-            probs_calibrated = F.softmax(scaled_logits, dim=1)
-        else:
-            probs_calibrated = _corn_logits_to_probas(scaled_logits)
-
-    return probs_calibrated.numpy(), T_final
+        scaled = logits_t / T_final
+        probs = F.softmax(scaled, dim=1) if loss_type == "ce" else _corn_logits_to_probas(scaled)
+    return probs.numpy(), T_final
 
 
-# ==========================================================
-# FINE-TUNE K-FOLD GENERIK (dipakai proxy 2, 3) — dengan temperature scaling
-# ==========================================================
-# CATATAN METODOLOGIS: setiap fold dilatih fixed 3 epoch
-# (config.PROXY_FINETUNE_EPOCHS) TANPA validasi/early-stopping di dalam
-# fold -- ini keputusan desain yang disengaja untuk keperluan OOF generation
-# (beda dari train.py yang MEMANG pakai early-stopping untuk model final),
-# tapi berarti kualitas pred_probs per fold bisa under/overfit tanpa kontrol
-# eksplisit. Sebutkan ini sebagai batasan metodologis di Bab III/IV --
-# temperature scaling di atas MEMBANTU mengoreksi overconfidence akibat hal
-# ini, tapi tidak sepenuhnya menggantikan kontrol early-stopping per fold.
-def _finetune_kfold_oof(texts, labels, loss_type):
-    cached = _load_cache_if_valid(config.PROXY_PRED_PROBS_FILE, config.PROXY_PRED_PROBS_META_FILE, texts)
+# ---------------- fine-tune K-Fold generik (P3, P4) ----------------
+# Tiap fold: 3 epoch tetap, tanpa early stopping/scheduler (beda dari train.py) -- batasan metodologis.
+def _finetune_kfold_oof(texts, labels, loss_type, n_folds=None, cache_tag=""):
+    n_folds = n_folds or config.PROXY_CV_FOLDS
+    cache_file = _tagged(config.PROXY_PRED_PROBS_FILE, cache_tag)
+    meta_file = _tagged(config.PROXY_PRED_PROBS_META_FILE, cache_tag)
+    cached = _load_cache_if_valid(cache_file, meta_file, texts)
     if cached is not None:
         return cached
 
@@ -233,19 +158,16 @@ def _finetune_kfold_oof(texts, labels, loss_type):
     texts_arr = np.array(texts, dtype=object)
     labels_arr = np.array(labels)
 
-    skf = StratifiedKFold(n_splits=config.PROXY_CV_FOLDS, shuffle=True, random_state=42)
+    skf = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=42)
     fold_temperatures = []
 
     for fold, (train_idx, val_idx) in enumerate(skf.split(texts_arr, labels_arr)):
-        print(f"   [Proxy {config.PROXY_NAME}] Fold {fold + 1}/{config.PROXY_CV_FOLDS} "
-              f"(train={len(train_idx)}, val={len(val_idx)})...")
+        print(f"   [Proxy {config.PROXY_NAME}{(' ' + cache_tag) if cache_tag else ''}] "
+              f"Fold {fold + 1}/{n_folds} (train={len(train_idx)}, val={len(val_idx)})...")
 
-        # --- BARU: pisahkan validasi INTERNAL di dalam bagian latih fold ini
-        # (bukan pada fold yang ditahan) khusus untuk mencari T -- Subbab III.F.2 ---
+        # validasi INTERNAL dalam bagian latih fold -> khusus mencari T (§3.4, §3.6)
         inner_train_idx, inner_calib_idx = train_test_split(
-            train_idx, test_size=0.1, random_state=42,
-            stratify=labels_arr[train_idx],
-        )
+            train_idx, test_size=0.1, random_state=42, stratify=labels_arr[train_idx])
 
         model = (IndoBERTCORN() if loss_type == "corn" else IndoBERTStandard()).to(config.DEVICE)
         optimizer = torch.optim.AdamW(model.parameters(), lr=config.PROXY_FINETUNE_LR)
@@ -270,7 +192,8 @@ def _finetune_kfold_oof(texts, labels, loss_type):
                 lbl = batch["labels"].to(config.DEVICE)
                 with torch.cuda.amp.autocast():
                     logits = model(input_ids, attention_mask)
-                    loss = criterion(logits, lbl) if loss_type == "ce" else corn_loss(logits, lbl, num_classes=config.NUM_CLASSES)
+                    loss = (criterion(logits, lbl) if loss_type == "ce"
+                            else corn_loss(logits, lbl, num_classes=config.NUM_CLASSES))
                 scaler.scale(loss).backward()
                 scaler.step(optimizer)
                 scaler.update()
@@ -279,13 +202,10 @@ def _finetune_kfold_oof(texts, labels, loss_type):
 
         model.eval()
 
-        # logits pada validasi INTERNAL (dalam fold ini) -- untuk fit T
         calib_logits, calib_labels = [], []
         with torch.no_grad():
             for batch in calib_loader:
-                input_ids = batch["input_ids"].to(config.DEVICE)
-                attention_mask = batch["attention_mask"].to(config.DEVICE)
-                logits = model(input_ids, attention_mask)
+                logits = model(batch["input_ids"].to(config.DEVICE), batch["attention_mask"].to(config.DEVICE))
                 calib_logits.append(logits.cpu().numpy())
                 calib_labels.append(batch["labels"].numpy())
         calib_logits = np.concatenate(calib_logits, axis=0)
@@ -294,22 +214,17 @@ def _finetune_kfold_oof(texts, labels, loss_type):
         _dummy, T_fold = _calibrate_with_temperature(calib_logits, calib_labels, loss_type)
         fold_temperatures.append(T_fold)
 
-        # logits pada fold yang DITAHAN (val_idx, OOF sesungguhnya) -- terapkan T_fold
         fold_logits = []
         with torch.no_grad():
             for batch in val_loader:
-                input_ids = batch["input_ids"].to(config.DEVICE)
-                attention_mask = batch["attention_mask"].to(config.DEVICE)
-                logits = model(input_ids, attention_mask)
+                logits = model(batch["input_ids"].to(config.DEVICE), batch["attention_mask"].to(config.DEVICE))
                 fold_logits.append(logits.cpu().numpy())
         fold_logits = np.concatenate(fold_logits, axis=0)
 
         logits_t = torch.tensor(fold_logits, dtype=torch.float32) / T_fold
         with torch.no_grad():
-            if loss_type == "ce":
-                probs = torch.nn.functional.softmax(logits_t, dim=1)
-            else:
-                probs = _corn_logits_to_probas(logits_t)
+            probs = (torch.nn.functional.softmax(logits_t, dim=1) if loss_type == "ce"
+                     else _corn_logits_to_probas(logits_t))
         oof_probs[val_idx] = probs.numpy()
 
         del model, optimizer
@@ -317,22 +232,18 @@ def _finetune_kfold_oof(texts, labels, loss_type):
 
     print(f"   🌡️  Temperature per fold [{config.PROXY_NAME}]: {[f'{t:.3f}' for t in fold_temperatures]} "
           f"(mean={np.mean(fold_temperatures):.3f})")
+    suffix = f"__{cache_tag}" if cache_tag else ""
+    pd.DataFrame({"fold": range(1, n_folds + 1), "temperature": fold_temperatures}).to_csv(
+        os.path.join(config.RESULTS_DIR, f"temperature_per_fold__{config.PROXY_NAME}{suffix}.csv"), index=False)
 
-    _save_cache(config.PROXY_PRED_PROBS_FILE, config.PROXY_PRED_PROBS_META_FILE, texts, oof_probs)
+    _save_cache(cache_file, meta_file, texts, oof_probs)
     return oof_probs
 
 
-# ==========================================================
-# DISPATCHER — SATU-SATUNYA FUNGSI YANG DIPANGGIL DARI clean.py
-# ==========================================================
+# ---------------- dispatcher ----------------
 def get_proxy_pred_probs(texts, labels):
-    """
-    Mengembalikan OOF pred_probs (SUDAH DIKALIBRASI untuk P3-P4) sesuai
-    config.PROXY_ID (0-3). HANYA 4 PROXY (P1-P4), sesuai Tabel 3.1 dan
-    Batasan Masalah -- tidak ada proxy dengan backbone/mekanisme di luar itu.
-    """
+    """OOF pred_probs (terkalibrasi untuk P3/P4) sesuai config.PROXY_ID (0-3)."""
     print(f"\n🧮 Menghitung OOF pred_probs — proxy [{config.PROXY_ID}] {config.PROXY_NAME}")
-
     if config.PROXY_ID == 0:
         return _proxy_frozen_lr(texts, labels, pooling="cls")
     elif config.PROXY_ID == 1:
@@ -341,8 +252,4 @@ def get_proxy_pred_probs(texts, labels):
         return _finetune_kfold_oof(texts, labels, loss_type="ce")
     elif config.PROXY_ID == 3:
         return _finetune_kfold_oof(texts, labels, loss_type="corn")
-    else:
-        raise ValueError(
-            f"PROXY_ID tidak dikenal: {config.PROXY_ID} (harus 0-3, sesuai 4 tahap "
-            f"ablasi Tabel 3.1)."
-        )
+    raise ValueError(f"PROXY_ID tidak dikenal: {config.PROXY_ID} (harus 0-3, Tabel 3.1).")

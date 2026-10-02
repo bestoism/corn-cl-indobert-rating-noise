@@ -1,16 +1,9 @@
 """
-data_split.py -- Pembagian data latih (70%), validasi (10%), dan uji (20%)
-sesuai Subbab III.E: stratified BERDASARKAN RATING, grouped BERDASARKAN
-TEKS ULASAN (seluruh baris berteks identik jatuh di sisi split yang sama),
-random_state tetap (42). Dijalankan SEKALI setelah praproses dan SEBELUM
-Confident Learning.
-
-CATATAN METODOLOGIS: stratifikasi murni per-baris tidak mungkin dipertahankan
-bersamaan dengan syarat grouped split, sehingga stratifikasi dilakukan pada
-level GRUP (rating mayoritas tiap teks unik) -- pendekatan pragmatis yang
-perlu disebutkan eksplisit di Bab III/IV kalau ditanya penguji.
+data_split.py -- Pembagian 70:10:20 (§3.4): stratified berdasarkan RATING, grouped
+berdasarkan TEKS (semua baris berteks identik jatuh ke sisi split yang sama).
+Stratifikasi dilakukan pada level grup teks unik (rating mayoritas grup).
+Parameter seed menentukan partisi; seed 42 = split utama.
 """
-
 import os
 import pandas as pd
 from sklearn.model_selection import train_test_split
@@ -27,13 +20,20 @@ def _group_table(df):
     return g.reset_index().rename(columns={RATING_COL: "majority_rating"})
 
 
-def create_splits(input_path=None, seed=RANDOM_STATE):
+def create_splits(input_path=None, seed=RANDOM_STATE, overwrite=False):
+    paths = (config.TRAIN_RAW_FILE, config.VAL_FILE, config.TEST_FILE)
+    if not overwrite and all(os.path.exists(p) for p in paths):
+        raise FileExistsError(
+            f"Split untuk seed {seed} sudah ada ({config.TRAIN_RAW_FILE}). "
+            f"Tidak ditimpa. Pakai overwrite=True hanya jika benar-benar disengaja."
+        )
+
     input_path = input_path or config.CLEAN_TEXT_FILE
     df = pd.read_csv(input_path)
 
     train_prop = 1 - config.VAL_SIZE - config.TEST_SIZE
     group_tab = _group_table(df)
-    print(f"📦 Jumlah teks unik: {len(group_tab)} (dari {len(df)} baris)")
+    print(f"📦 Jumlah teks unik: {len(group_tab)} (dari {len(df)} baris) | seed split = {seed}")
 
     train_groups, temp_groups = train_test_split(
         group_tab, train_size=train_prop, random_state=seed,
@@ -48,6 +48,14 @@ def create_splits(input_path=None, seed=RANDOM_STATE):
     train_texts = set(train_groups[TEXT_COL])
     val_texts = set(val_groups[TEXT_COL])
     test_texts = set(test_groups[TEXT_COL])
+
+    # Bukti tidak ada kebocoran teks lintas split (angka ini masuk Bab III)
+    overlap_tv = len(train_texts & val_texts)
+    overlap_tt = len(train_texts & test_texts)
+    overlap_vt = len(val_texts & test_texts)
+    assert overlap_tv == 0 and overlap_tt == 0 and overlap_vt == 0, \
+        f"Ada teks yang bocor lintas split! train∩val={overlap_tv}, train∩test={overlap_tt}, val∩test={overlap_vt}"
+    print("✅ Verifikasi: overlap teks train∩val = train∩test = val∩test = 0")
 
     df_train = df[df[TEXT_COL].isin(train_texts)].copy()
     df_val = df[df[TEXT_COL].isin(val_texts)].copy()
@@ -73,8 +81,9 @@ def create_splits(input_path=None, seed=RANDOM_STATE):
     df_test.to_csv(config.TEST_FILE, index=False)
 
     pd.DataFrame([{
-        "n_total": total, "n_train": len(df_train), "n_val": len(df_val),
+        "split_seed": seed, "n_total": total, "n_train": len(df_train), "n_val": len(df_val),
         "n_test": len(df_test), "pct_rows_in_dup_groups": round(pct_dup_rows, 2),
+        "overlap_train_val": overlap_tv, "overlap_train_test": overlap_tt, "overlap_val_test": overlap_vt,
     }]).to_csv(os.path.join(config.RESULTS_DIR, "split_summary.csv"), index=False)
 
     return df_train, df_val, df_test

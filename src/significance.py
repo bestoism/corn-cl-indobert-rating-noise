@@ -276,3 +276,44 @@ def run_all_qwk_effect_sizes(true_labels, preds_per_seed):
         bootstrap_qwk_difference(true_labels, preds_per_seed, a, b)
         for _, a, b in PRE_REGISTERED_HYPOTHESES
     ])
+    
+# ==========================================================
+# 6. ANALISIS SENSITIVITAS: QWK PER-SEED (pelengkap, bukan pengganti definisi utama §3.12)
+# ==========================================================
+def _qwk_fast(y_true, y_pred, k=5):
+    cm = np.bincount((y_true - 1) * k + (y_pred - 1), minlength=k * k).reshape(k, k).astype(float)
+    w = (np.arange(k)[:, None] - np.arange(k)[None, :]) ** 2 / (k - 1) ** 2
+    exp = np.outer(cm.sum(1), cm.sum(0)) / cm.sum()
+    return 1 - (w * cm).sum() / (w * exp).sum()
+
+
+def bootstrap_qwk_difference_per_seed(true_labels, preds_per_seed, model_a, model_b, n_boot=2000, seed=42):
+    """
+    Estimand = selisih rata-rata QWK PER-SEED (konsisten dengan tabel mean±std), BUKAN QWK dari
+    prediksi ensemble. Dilaporkan berdampingan dengan versi ensemble di bootstrap_qwk_difference().
+    """
+    rng = np.random.default_rng(seed)
+    y = np.asarray(true_labels).astype(int)
+    n = len(y)
+    A = [np.asarray(p).astype(int) for p in preds_per_seed[model_a].values()]
+    B = [np.asarray(p).astype(int) for p in preds_per_seed[model_b].values()]
+
+    def mean_qwk(P, idx):
+        return float(np.mean([_qwk_fast(y[idx], p[idx]) for p in P]))
+
+    full = np.arange(n)
+    qa, qb = mean_qwk(A, full), mean_qwk(B, full)
+    boots = np.empty(n_boot)
+    for i in range(n_boot):
+        idx = rng.integers(0, n, n)
+        boots[i] = mean_qwk(A, idx) - mean_qwk(B, idx)
+    lo, hi = np.percentile(boots, [2.5, 97.5])
+    return {"model_a": model_a, "model_b": model_b, "qwk_a": qa, "qwk_b": qb,
+            "qwk_diff": qa - qb, "ci_95_low": lo, "ci_95_high": hi}
+
+
+def run_all_qwk_per_seed(true_labels, preds_per_seed):
+    return pd.DataFrame([
+        bootstrap_qwk_difference_per_seed(true_labels, preds_per_seed, a, b)
+        for _, a, b in PRE_REGISTERED_HYPOTHESES
+    ])

@@ -2,7 +2,7 @@
 gold_test.py -- Pembentukan dan evaluasi subset uji emas (gold test subset),
 sesuai Bab III Subbab 3.9.4. Ini adalah pemeriksaan ketahanan (robustness
 check) SEKUNDER, tidak menggantikan data uji penuh dan tidak dipakai untuk
-uji hipotesis formal H1-H4 (itu tetap di significance.py, data uji penuh).
+uji hipotesis formal H1-H5 (itu tetap di significance.py, data uji penuh).
 """
 
 import os
@@ -38,6 +38,7 @@ def sample_gold_test_subset(seed=42, n_override=None):
     ini akan melaporkan n aktual apa adanya di Bab III/IV, bukan target ideal
     yang tidak tercapai (Subbab 1.5, 3.9.4).
     """
+    config.require_primary_split("Gold test")
     df_test = pd.read_csv(config.TEST_FILE)
     N = len(df_test)
     n_target = n_override or _cochran_n(N)
@@ -72,6 +73,7 @@ def sample_gold_test_subset(seed=42, n_override=None):
 
 
 def export_second_annotator_gold_subset(fraction=None, seed=99):
+    config.require_primary_split("Gold test")
     fraction = fraction or config.SECOND_ANNOTATOR_FRACTION
     if not os.path.exists(config.GOLD_TEST_SAMPLE_FILE):
         print("⚠️ Sample uji emas belum ada -- jalankan sample_gold_test_subset() dulu.")
@@ -90,6 +92,7 @@ def export_second_annotator_gold_subset(fraction=None, seed=99):
 def compute_gold_interannotator_kappa():
     """Quadratic-weighted kappa (bukan kappa polos) karena rating di sini
     ordinal 1-5, bukan kategori noise/not_noise/ambiguous."""
+    config.require_primary_split("Gold test")
     path2 = config.GOLD_TEST_SAMPLE_FILE.replace(".csv", "_annotator2.csv")
     if not (os.path.exists(config.GOLD_TEST_RESULT_FILE) and os.path.exists(path2)):
         print("⚠️ File anotator 1 (hasil final) dan/atau anotator 2 belum lengkap.")
@@ -159,6 +162,7 @@ def evaluate_on_gold_subset(scenarios):
     Wilcoxon dan koreksi Holm-Bonferroni formal kedua, sesuai Subbab 3.9.4 --
     ukuran sampel di sini tidak dirancang untuk uji berdaya penuh.
     """
+    config.require_primary_split("Gold test")
     df_gold = _load_gold_labels()
     if df_gold is None:
         return None
@@ -235,8 +239,30 @@ def evaluate_on_gold_subset(scenarios):
     df_effect.to_csv(config.GOLD_TEST_EFFECT_SIZE_FILE, index=False)
     print(f"\n💾 Arah & effect size subset uji emas -> {config.GOLD_TEST_EFFECT_SIZE_FILE}")
     print(df_effect.to_string(index=False))
-    print("\n📌 Bandingkan arah di atas dengan hasil H1-H4 data uji penuh (Cell 22) --")
+    print("\n📌 Bandingkan arah di atas dengan hasil H1-H5 data uji penuh (Cell 22) --")
     print("   konsisten memperkuat validitas, tidak konsisten dilaporkan sebagai temuan")
     print("   yang membatasi generalisasi (Subbab 3.9.4).")
 
     return df_result, df_effect
+
+
+def write_rubric(overwrite=False):
+    """Rubrik operasional singkat per kelas rating (§3.10). Hanya klaim 'rubrik disediakan'
+    di laporan jika anotasi memang memakainya."""
+    config.require_primary_split("Gold test")
+    if os.path.exists(config.GOLD_TEST_RUBRIC_FILE) and not overwrite:
+        print(f"ℹ️ Rubrik sudah ada: {config.GOLD_TEST_RUBRIC_FILE}")
+        return
+    text = """# Rubrik anotasi uji emas (baca HANYA teks ulasan; rating asli disembunyikan)
+| Rating | Kriteria operasional |
+|---|---|
+| 1 | Keluhan berat/tegas: aplikasi tidak berfungsi, merasa dirugikan, kemarahan, tidak merekomendasikan; tanpa apresiasi sama sekali. |
+| 2 | Dominan negatif: masalah signifikan, tetapi ada nada kompromi atau apresiasi kecil. |
+| 3 | Campuran/netral: pujian dan keluhan seimbang, atau teks tidak bermuatan evaluatif yang jelas. |
+| 4 | Dominan positif: puas dan merekomendasikan, dengan keluhan kecil atau saran perbaikan. |
+| 5 | Sangat positif: pujian tegas tanpa keluhan material. |
+| ND | Tidak dapat ditentukan dari teks: rating yang wajar bergantung informasi eksternal (mis. status transaksi). |
+Aturan: jangan menebak rating asli; jangan memakai prediksi model apa pun; isi ND bila ragu karena info eksternal."""
+    with open(config.GOLD_TEST_RUBRIC_FILE, "w", encoding="utf-8") as f:
+        f.write(text)
+    print(f"📝 Rubrik -> {config.GOLD_TEST_RUBRIC_FILE}")

@@ -459,6 +459,22 @@ def write_manifest(df, path, load_stats, extra):
     return manifest
 
 
+def verify_manifest(path=RAW_DATA_FILE, manifest_path=MANIFEST_FILE):
+    """Verifikasi SHA-256 + jumlah baris korpus terhadap manifest (Batasan Masalah butir 6)."""
+    with open(manifest_path, encoding="utf-8") as f:
+        m = json.load(f)
+    current = _sha256(path)
+    n_rows = len(pd.read_csv(path))
+    ok_hash = current == m["sha256"]
+    ok_rows = n_rows == m["n_rows_final"]
+    print(f"SHA-256 manifest : {m['sha256']}")
+    print(f"SHA-256 saat ini : {current}  -> {'COCOK ✅' if ok_hash else 'TIDAK COCOK ❌'}")
+    print(f"Jumlah baris     : {n_rows} (manifest {m['n_rows_final']}) -> {'COCOK ✅' if ok_rows else 'TIDAK COCOK ❌'}")
+    if not (ok_hash and ok_rows):
+        raise RuntimeError("Korpus berbeda dari manifest -- seluruh eksperimen harus dijalankan ulang.")
+    return True
+
+
 # ==========================================================
 # MAIN
 # ==========================================================
