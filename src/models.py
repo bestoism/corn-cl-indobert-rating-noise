@@ -1,53 +1,38 @@
-"""
-models.py -- Arsitektur model untuk baseline (Cross-Entropy), CORN (ordinal
-regression), dan CORN+fusi sentimen eksternal (P5). Backbone tunggal
-(config.PRETRAINED_MODEL_NAME = IndoBERT), sesuai Batasan Masalah Bab 1.6.
-"""
+"""models.py: IndoBERT dengan keluaran 5 neuron (CE) atau 4 neuron (CORN). Dropout 0,3 dan pooler_output."""
 
-import torch
 import torch.nn as nn
 from transformers import AutoModel
+
 from src import config
 
 
 class IndoBERTStandard(nn.Module):
-    """Model baseline: Cross-Entropy, output 5 neuron (satu neuron per kelas rating)."""
-
     def __init__(self):
         super().__init__()
         self.bert = AutoModel.from_pretrained(config.PRETRAINED_MODEL_NAME)
-        self.dropout = nn.Dropout(0.3)
+        self.dropout = nn.Dropout(config.DROPOUT)
         self.classifier = nn.Linear(self.bert.config.hidden_size, config.NUM_CLASSES)
 
     def forward(self, input_ids, attention_mask):
-        outputs = self.bert(input_ids=input_ids, attention_mask=attention_mask)
-        pooled = self.dropout(outputs.pooler_output)
+        pooled = self.dropout(self.bert(input_ids=input_ids, attention_mask=attention_mask).pooler_output)
         return self.classifier(pooled)
 
 
 class IndoBERTCORN(nn.Module):
-    """Model ordinal regression (CORN): output K-1 neuron (4 neuron untuk 5 kelas rating)."""
-
     def __init__(self):
         super().__init__()
         self.bert = AutoModel.from_pretrained(config.PRETRAINED_MODEL_NAME)
-        self.dropout = nn.Dropout(0.3)
+        self.dropout = nn.Dropout(config.DROPOUT)
         self.classifier = nn.Linear(self.bert.config.hidden_size, config.NUM_CLASSES - 1)
 
     def forward(self, input_ids, attention_mask):
-        outputs = self.bert(input_ids=input_ids, attention_mask=attention_mask)
-        pooled = self.dropout(outputs.pooler_output)
+        pooled = self.dropout(self.bert(input_ids=input_ids, attention_mask=attention_mask).pooler_output)
         return self.classifier(pooled)
 
 
 def build_model(loss_type):
-    """
-    Factory kecil supaya train.py dan proxy.py tidak perlu tahu detail
-    kelas mana yang dipanggil -- cukup sebut 'ce' atau 'corn'.
-    """
     if loss_type == "ce":
-        return IndoBERTStandard().to(config.DEVICE)
-    elif loss_type == "corn":
-        return IndoBERTCORN().to(config.DEVICE)
-    else:
-        raise ValueError(f"loss_type harus 'ce' atau 'corn', dapat: {loss_type}")
+        return IndoBERTStandard().to(config.get_device())
+    if loss_type == "corn":
+        return IndoBERTCORN().to(config.get_device())
+    raise ValueError(f"loss_type harus 'ce' atau 'corn', dapat: {loss_type}")

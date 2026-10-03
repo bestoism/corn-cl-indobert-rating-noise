@@ -1,115 +1,45 @@
-"""
-diagnostics.py -- Diagnostik yang dijanjikan laporan:
-  * §3.6 butir 2 : monotonisitas P(y>k) + Expected Calibration Error (ECE)
-  * §3.6 butir 7 : kualitas proxy per kelas rating asli
-  * §3.8         : distribusi jarak ordinal pada baris noise per kelas rating
-  * §3.7         : ukuran sampel Cochran
-Semua keluaran disimpan ke config.RESULTS_DIR (split-aware).
-"""
-import os
-import math
+"""diagnostics.py: distribusi jarak ordinal pada baris noise per kelas rating asli (Subbab 3.8)."""
+
 import numpy as np
 import pandas as pd
 
 from src import config
 
 
-def cochran_n(N, p=0.5, z=1.96, e=0.10):
-    n0 = z ** 2 * p * (1 - p) / e ** 2
-    return math.ceil(n0 / (1 + (n0 - 1) / N))
-
-
-def cumulative_probs(pred_probs):
-    """q[:, j] = P(y > j+1) untuk j=0..K-2, diturunkan dari probabilitas kelas."""
-    return 1.0 - np.cumsum(np.asarray(pred_probs, dtype=float), axis=1)[:, :-1]
-
-
-def _binary_ece(p, y, n_bins=10):
-    edges = np.linspace(0, 1, n_bins + 1)
-    idx = np.clip(np.digitize(p, edges[1:-1]), 0, n_bins - 1)
-    ece = 0.0
-    for b in range(n_bins):
-        m = idx == b
-        if m.any():
-            ece += m.mean() * abs(y[m].mean() - p[m].mean())
-    return float(ece)
-
-
-def report_calibration(pred_probs, labels, n_bins=10, tol=1e-6, tag=""):
-    """labels 0-indexed. ECE atas probabilitas kumulatif P(y>k) per ambang + ECE top-label."""
-    pred_probs = np.asarray(pred_probs, dtype=float)
-    labels = np.asarray(labels)
-    q = cumulative_probs(pred_probs)
-
+def noise_distance_by_class(df_flagged, quality_df, threshold=None):
+    """
+    df_flagged: seluruh data latih dengan kolom rating, rating_diff, is_noise (metode terpilih).
+    quality_df: keluaran calibration.per_class_quality untuk proxy yang sama.
+    Menghasilkan tabel per kelas rating asli: jumlah baris, jumlah ter-flag, distribusi jarak
+    ordinal 1 sampai 4 pada baris ter-flag, persentase jarak >= ambang severity, serta recall
+    dan precision proxy sebagai rujukan pemeriksaan confound.
+    """
+    threshold = config.SEVERITY_THRESHOLD if threshold is None else threshold
     rows = []
-    for j in range(q.shape[1]):
-        rows.append({"metric": f"ECE P(y>{j+1})",
-                     "value": _binary_ece(q[:, j], (labels > j).astype(float), n_bins)})
-    mean_ece = float(np.mean([r["value"] for r in rows]))
-    rows.append({"metric": "ECE rata-rata P(y>k)", "value": mean_ece})
-
-    conf = pred_probs.max(axis=1)
-    correct = (pred_probs.argmax(axis=1) == labels).astype(float)
-    rows.append({"metric": "ECE top-label", "value": _binary_ece(conf, correct, n_bins)})
-
-    n_viol = int((np.diff(q, axis=1) > tol).sum())
-    rows.append({"metric": f"pelanggaran monotonisitas P(y>k) (tol={tol})", "value": n_viol})
-    rows.append({"metric": "n_baris", "value": len(labels)})
-
-    out = pd.DataFrame(rows)
-    path = os.path.join(config.RESULTS_DIR, f"calibration_report__{config.PROXY_NAME}{tag}.csv")
-    out.to_csv(path, index=False)
-    print(f"\n🌡️  Kalibrasi [{config.PROXY_NAME}{tag}]: ECE rata-rata P(y>k) = {mean_ece:.4f} | "
-          f"ECE top-label = {rows[-4]['value']:.4f} | pelanggaran monotonisitas = {n_viol}")
-    print(f"   -> {path}")
-    print("   Catatan: probabilitas kumulatif diturunkan dari probabilitas kelas non-negatif, sehingga\n"
-          "   monotonisitas terjamin secara konstruksi; pemeriksaan ini berfungsi sebagai guard numerik.")
-    return {"mean_ece": mean_ece, "n_monotonic_violations": n_viol}
-
-
-def per_class_proxy_quality(labels, preds, tag=""):
-    """labels/preds 0-indexed. Recall, precision, MAE per kelas rating ASLI."""
-    labels = np.asarray(labels)
-    preds = np.asarray(preds)
-    rows = []
-    for c in range(config.NUM_CLASSES):
-        m_true = labels == c
-        m_pred = preds == c
-        rows.append({
-            "rating_asli": c + 1,
-            "n": int(m_true.sum()),
-            "recall": float((preds[m_true] == c).mean()) if m_true.any() else np.nan,
-            "precision": float((labels[m_pred] == c).mean()) if m_pred.any() else np.nan,
-            "mae": float(np.abs(preds[m_true] - labels[m_true]).mean()) if m_true.any() else np.nan,
-        })
-    out = pd.DataFrame(rows)
-    path = os.path.join(config.RESULTS_DIR, f"proxy_per_class__{config.PROXY_NAME}{tag}.csv")
-    out.to_csv(path, index=False)
-    print(f"\n📐 Kualitas proxy per kelas rating asli [{config.PROXY_NAME}]:")
-    print(out.round(4).to_string(index=False))
-    print(f"   -> {path}")
-    return out
-
-
-def noise_distribution_by_rating(df, tag=""):
-    """df harus punya kolom rating, is_noise, rating_diff (hasil clean.py, sebelum resolusi)."""
-    rows = []
-    for r in sorted(df["rating"].unique()):
-        sub = df[df["rating"] == r]
-        flagged = sub[sub["is_noise"]]
-        row = {"rating_asli": int(r), "n": len(sub), "n_flagged": len(flagged),
-               "pct_flagged": round(len(flagged) / len(sub) * 100, 2)}
-        for d in [1, 2, 3, 4]:
-            row[f"diff_{d}"] = int((flagged["rating_diff"].clip(upper=4) == d).sum())
-        row["pct_severe(diff>=thr)"] = (
-            round((flagged["rating_diff"] >= config.SEVERITY_THRESHOLD).mean() * 100, 2)
-            if len(flagged) else np.nan
-        )
+    for r in range(1, config.NUM_CLASSES + 1):
+        cls = df_flagged[df_flagged["rating"] == r]
+        noisy = cls[cls["is_noise"]]
+        n_cls, n_noise = len(cls), len(noisy)
+        row = {"rating": r, "n_baris_kelas": n_cls, "n_flag": n_noise,
+               "pct_flag_dalam_kelas": 100.0 * n_noise / n_cls if n_cls else float("nan")}
+        for d in range(1, 5):
+            row[f"n_jarak{d}"] = int((noisy["rating_diff"].clip(upper=4) == d).sum())
+        n_sev = int((noisy["rating_diff"] >= threshold).sum())
+        row["n_jarak_ge_ambang"] = n_sev
+        row["pct_jarak_ge_ambang_dari_flag"] = 100.0 * n_sev / n_noise if n_noise else float("nan")
         rows.append(row)
     out = pd.DataFrame(rows)
-    path = os.path.join(config.RESULTS_DIR, f"noise_distribution_by_rating__{config.PROXY_NAME}{tag}.csv")
-    out.to_csv(path, index=False)
-    print(f"\n📊 Distribusi jarak ordinal pada baris noise per kelas rating asli (§3.8):")
-    print(out.to_string(index=False))
-    print(f"   -> {path}")
+
+    q = quality_df[["rating", "recall", "precision", "mae"]].rename(
+        columns={"recall": "recall_proxy", "precision": "precision_proxy", "mae": "mae_proxy"})
+    out = out.merge(q, on="rating", how="left")
+
+    # Penanda confound: kelas yang masuk dua teratas pada persentase jarak berat sekaligus
+    # dua terbawah pada recall proxy (operasionalisasi "bertepatan" pada Subbab 3.8).
+    valid = out.dropna(subset=["pct_jarak_ge_ambang_dari_flag", "recall_proxy"])
+    top_sev = set(valid.nlargest(2, "pct_jarak_ge_ambang_dari_flag")["rating"])
+    low_rec = set(valid.nsmallest(2, "recall_proxy")["rating"])
+    out["penanda_confound_recall"] = out["rating"].apply(lambda r: "YA" if (r in top_sev and r in low_rec) else "tidak")
+    low_prec = set(valid.dropna(subset=["precision_proxy"]).nsmallest(2, "precision_proxy")["rating"])
+    out["penanda_confound_precision"] = out["rating"].apply(lambda r: "YA" if (r in top_sev and r in low_prec) else "tidak")
     return out

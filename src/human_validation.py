@@ -1,234 +1,179 @@
+"""human_validation.py: validasi manusia atas baris ter-flag P4 (Subbab 3.7). Hanya split utama."""
+
 import os
+
 import numpy as np
 import pandas as pd
 from sklearn.metrics import cohen_kappa_score
 
-from src import config
+from src import annotation, config, drive_io, sampling
 
-VALID_VERDICTS = {"noise", "not_noise", "ambiguous"}
+VALID = set(config.HUMAN_VERDICTS)
+ANNOTATOR_COLS = ["review_id", "source_app", "review_text", "cleaned_text", "rating"]
 
 
-def _load_validated_sample():
-    """Baca file anotator (BUTA), lalu join dengan referensi internal untuk
-    mendapatkan kembali rating_diff (dibutuhkan untuk breakdown per-bin)."""
-    if not os.path.exists(config.HUMAN_VALIDATION_FILE):
-        print(f"⚠️ File belum ada: {config.HUMAN_VALIDATION_FILE}")
-        print("   Jalankan clean.py dulu untuk men-generate file sample-nya.")
-        return None
+def _paths():
+    return config.ANNOT_FILES
 
-    df = None
-    tried = []
-    for sep in [";", ","]:
-        try:
-            candidate = pd.read_csv(config.HUMAN_VALIDATION_FILE, sep=sep)
-            tried.append(f"'{sep}' -> kolom: {candidate.columns.tolist()}")
-            if "human_verdict" in candidate.columns:
-                df = candidate
-                print(f"   (file dibaca dengan delimiter '{sep}')")
-                break
-        except pd.errors.ParserError:
-            tried.append(f"'{sep}' -> ParserError")
-            continue
 
-    if df is None:
-        print("⚠️ Gagal membaca file dengan delimiter ';' maupun ','.")
-        for t in tried:
-            print(f"   Percobaan: {t}")
-        raise ValueError(f"Gagal membaca {config.HUMAN_VALIDATION_FILE}.")
+def report_sample_size(df_noise):
+    """Subbab 3.7: n Cochran dari N baris ter-flag P4, dibulatkan ke n perencanaan."""
+    c = sampling.cochran_n(len(df_noise))
+    print(f"N baris ter-flag P4 (data latih)     : {c['N']}")
+    print(f"n0 = Z^2 p (1 - p) / e^2             : {c['n0']:.2f}")
+    print(f"n setelah koreksi populasi terbatas  : {c['n_cochran']}")
+    print(f"n perencanaan yang dipakai (Subbab 3.7): {config.HUMAN_VALIDATION_N}")
+    return c
 
+
+def create_sample(ctx, df_noise):
+    """Alur B: membuat sampel buta kosong dan sidecar. Menolak bila berkas sudah ada."""
+    ctx.require_main("validasi manusia")
+    path = _paths()["human_validation"]
+    annotation.assert_can_create(path, "human_verdict")
+
+    cochran = report_sample_size(df_noise)
+    sample, plan = sampling.stratified_human_sample(df_noise, n=config.HUMAN_VALIDATION_N, seed=42)
+    print(f"Alokasi per bin jarak ordinal: {plan['take']} (total {plan['total']})")
+    if plan["shortfall"]:
+        print(f"[PERINGATAN] Kolam bin kurang dari target: {plan['shortfall']} (dilaporkan apa adanya).")
+
+    blind = sample[ANNOTATOR_COLS].copy()
+    blind["human_verdict"] = ""
+    blind["human_note"] = ""
+    drive_io.write_once_csv(blind, path)
+    annotation.write_sidecar(path, df_noise["review_id"].astype(str).tolist(),
+                             "baris ter-flag P4 K=5 pada data latih split utama",
+                             extra={"n_cochran": cochran["n_cochran"], "n_sampel": len(blind),
+                                    "alokasi": {str(k): int(v) for k, v in plan["take"].items()}})
+    print(f"[OK] Sampel buta dibuat: {path}")
+    print("Isi kolom 'human_verdict' dengan: noise / not_noise / ambiguous, lalu simpan di Drive.")
+    return blind
+
+
+def create_second_annotator(fraction=None, seed=99):
+    fraction = fraction or config.SECOND_ANNOTATOR_FRACTION
+    p1, p2 = _paths()["human_validation"], _paths()["human_validation_annotator2"]
+    annotation.assert_can_create(p2, "human_verdict")
+    df = pd.read_csv(p1)
+    n_sub = max(1, int(round(len(df) * fraction)))
+    subset = df.drop(columns=["human_verdict", "human_note"], errors="ignore").sample(n=n_sub, random_state=seed)
+    subset["human_verdict"] = ""
+    subset["human_note"] = ""
+    drive_io.write_once_csv(subset, p2)
+    with open(annotation.sidecar_path(p1), "r", encoding="utf-8") as f:
+        import json
+        parent = json.load(f)
+    annotation.write_sidecar(p2, [], "subset sampel validasi manusia untuk penilai kedua",
+                             extra={"sha256_review_id_terurut": parent["sha256_review_id_terurut"],
+                                    "n_review_id_dasar": parent["n_review_id_dasar"], "n_sampel": n_sub})
+    print(f"[OK] Sampel penilai kedua: {n_sub} baris -> {p2}")
+    return p2
+
+
+def verify_annotation(df_noise):
+    """Alur A: verifikasi hash sidecar terhadap baris ter-flag P4 pada run saat ini."""
+    path = _paths()["human_validation"]
+    info = annotation.verify_sidecar(path, df_noise["review_id"].astype(str).tolist(), "validasi manusia")
+    print(f"[OK] Hash sidecar validasi manusia cocok (n dasar = {info['n_review_id_dasar']}).")
+    p2 = _paths()["human_validation_annotator2"]
+    if os.path.exists(p2):
+        annotation.verify_subset_of_sample(path, p2)
+        print("[OK] Berkas penilai kedua konsisten dengan sampel.")
+    return info
+
+
+def _load_complete(df_noise):
+    path = _paths()["human_validation"]
+    df = pd.read_csv(path)
     df["human_verdict"] = df["human_verdict"].astype(str).str.strip().str.lower()
-
-    if os.path.exists(config.HUMAN_VALIDATION_INTERNAL_FILE):
-        internal = pd.read_csv(config.HUMAN_VALIDATION_INTERNAL_FILE)[["review_id", "rating_diff"]]
-        df = df.merge(internal, on="review_id", how="left")
-    else:
-        print("⚠️ File referensi internal tidak ditemukan -- breakdown per-bin rating_diff dilewati.")
-        df["rating_diff"] = np.nan
-
+    empty = df["human_verdict"].isin(["", "nan", "none"])
+    if empty.any():
+        raise ValueError(f"Masih ada {int(empty.sum())} baris tanpa 'human_verdict'.")
+    bad = ~df["human_verdict"].isin(VALID)
+    if bad.any():
+        raise ValueError(f"Nilai human_verdict tidak dikenali: {df.loc[bad, 'human_verdict'].unique().tolist()}")
+    ref = df_noise[["review_id", "rating_diff"]].copy()
+    ref["review_id"] = ref["review_id"].astype(str)
+    df["review_id"] = df["review_id"].astype(str)
+    df = df.merge(ref, on="review_id", how="left")
+    if df["rating_diff"].isna().any():
+        raise ValueError("Ada review_id sampel yang tidak ditemukan pada baris ter-flag run ini.")
     return df
 
 
-def _check_completeness(df):
-    empty_mask = df["human_verdict"].isin(["", "nan", "none"]) | df["human_verdict"].isna()
-    n_empty = empty_mask.sum()
+def compute_agreement(ctx, df_noise):
+    ctx.require_main("validasi manusia")
+    verify_annotation(df_noise)
+    df = _load_complete(df_noise)
+    n = len(df)
+    vc = df["human_verdict"].value_counts()
+    agree, amb, dis = int(vc.get("noise", 0)), int(vc.get("ambiguous", 0)), int(vc.get("not_noise", 0))
+    print(f"Total sampel: {n} | setuju (noise): {agree} ({agree / n * 100:.1f}%) | "
+          f"ambigu: {amb} ({amb / n * 100:.1f}%) | tidak setuju (not_noise): {dis} ({dis / n * 100:.1f}%)")
 
-    if n_empty > 0:
-        print(f"⚠️ Masih ada {n_empty} baris yang belum diisi 'human_verdict'.")
-        print("   Isi manual semuanya, save, lalu jalankan lagi.")
-        return False
+    rows = []
+    for diff_val, g in df.groupby("rating_diff"):
+        m = len(g)
+        c = g["human_verdict"].value_counts()
+        rows.append({"rating_diff": int(diff_val), "n_sampel": m,
+                     "pct_noise": round(c.get("noise", 0) / m * 100, 1),
+                     "pct_not_noise": round(c.get("not_noise", 0) / m * 100, 1),
+                     "pct_ambiguous": round(c.get("ambiguous", 0) / m * 100, 1)})
+    breakdown = pd.DataFrame(rows).sort_values("rating_diff")
+    print(breakdown.to_string(index=False))
+    print("Acuan deskriptif (Northcutt dkk., 2021, domain gambar): sekitar 58 persen sampel terbukti isu. "
+          "Dibahas deskriptif-komparatif, tanpa ambang lulus atau gagal.")
 
-    invalid_mask = ~df["human_verdict"].isin(VALID_VERDICTS)
-    if invalid_mask.any():
-        bad_values = df.loc[invalid_mask, "human_verdict"].unique().tolist()
-        bad_rows = df.index[invalid_mask].tolist()
-        print(f"⚠️ Ada nilai 'human_verdict' yang tidak dikenali: {bad_values}")
-        print(f"   Baris ke-{bad_rows} (index dari 0). Nilai yang valid hanya: {sorted(VALID_VERDICTS)}")
-        return False
-
-    return True
-
-
-def compute_agreement():
-    df = _load_validated_sample()
-    if df is None:
-        return None
-    if not _check_completeness(df):
-        return None
-
-    counts = df["human_verdict"].value_counts()
-    total = len(df)
-    agree = counts.get("noise", 0)
-    ambiguous = counts.get("ambiguous", 0)
-    disagree = counts.get("not_noise", 0)
-
-    print("=" * 60)
-    print(" HASIL VALIDASI MANUSIA vs CLEANLAB ")
-    print("=" * 60)
-    print(f"Total sample direview : {total}")
-    print(f"Setuju (memang noise) : {agree} ({agree/total*100:.1f}%)")
-    print(f"Ambigu                : {ambiguous} ({ambiguous/total*100:.1f}%)")
-    print(f"Tidak setuju          : {disagree} ({disagree/total*100:.1f}%)")
-
-    print("\n📊 Agreement rate per rating_diff:")
-    breakdown_rows = []
-    for diff_val, group in df.groupby("rating_diff"):
-        n = len(group)
-        vc = group["human_verdict"].value_counts()
-        row = {
-            "rating_diff": diff_val, "n_sample": n,
-            "pct_noise": round(vc.get("noise", 0) / n * 100, 1),
-            "pct_not_noise": round(vc.get("not_noise", 0) / n * 100, 1),
-            "pct_ambiguous": round(vc.get("ambiguous", 0) / n * 100, 1),
-        }
-        breakdown_rows.append(row)
-        print(f"   diff={diff_val}: n={n} | noise={row['pct_noise']}% | "
-              f"not_noise={row['pct_not_noise']}% | ambiguous={row['pct_ambiguous']}%")
-
-    breakdown_df = pd.DataFrame(breakdown_rows).sort_values("rating_diff")
-
-    print("-" * 60)
-    print("Acuan pembanding (Northcutt et al., 2021, ImageNet): ~58% sample")
-    print("yang direview terbukti benar-benar issue -- acuan wajar, bukan standar mutlak.")
-    print("=" * 60)
-
-    df.to_csv(config.HUMAN_VALIDATION_RESULT_FILE, index=False)
-    print(f"\n💾 Hasil lengkap -> {config.HUMAN_VALIDATION_RESULT_FILE}")
-
-    return {
-        "agree": int(agree), "ambiguous": int(ambiguous), "disagree": int(disagree),
-        "total": int(total), "agreement_rate": round(agree / total, 4),
-        "breakdown_by_rating_diff": breakdown_df.to_dict(orient="records"),
-    }
+    summary = pd.DataFrame([{"n": n, "noise": agree, "ambiguous": amb, "not_noise": dis,
+                             "agreement_rate": round(agree / n, 4)}])
+    d = ctx.validation_dir
+    drive_io.write_once_csv(df, os.path.join(d, "human_validation_result.csv"))
+    drive_io.write_once_csv(breakdown, os.path.join(d, "human_validation_per_bin.csv"))
+    drive_io.write_once_csv(summary, os.path.join(d, "human_validation_summary.csv"))
+    return summary, breakdown
 
 
-# ==========================================================
-# ANOTATOR KEDUA + COHEN'S KAPPA -- Subbab 3.9.3
-# ==========================================================
-def export_second_annotator_subset(fraction=None, seed=99):
-    """Ekspor sebagian sample (default 30%) untuk dinilai independen oleh
-    penilai kedua, tetap BUTA seperti anotator pertama."""
-    fraction = fraction or config.SECOND_ANNOTATOR_FRACTION
-    if not os.path.exists(config.HUMAN_VALIDATION_FILE):
-        print("⚠️ Sample anotator pertama belum ada -- jalankan clean.py dulu.")
-        return None
-
-    df = pd.read_csv(config.HUMAN_VALIDATION_FILE)
-    n_sub = max(1, int(round(len(df) * fraction)))
-    subset = df.drop(columns=["human_verdict", "human_note"], errors="ignore").sample(
-        n=n_sub, random_state=seed
-    )
-    subset["human_verdict"] = ""
-    subset["human_note"] = ""
-    subset.to_csv(config.HUMAN_VALIDATION_ANNOTATOR2_FILE, index=False)
-    print(f"📝 Sample anotator kedua ({n_sub} baris, {fraction*100:.0f}% dari total) -> "
-          f"{config.HUMAN_VALIDATION_ANNOTATOR2_FILE}")
-    return config.HUMAN_VALIDATION_ANNOTATOR2_FILE
-
-
-def compute_interannotator_kappa():
-    """Cohen's kappa antara anotator pertama dan kedua pada baris overlap.
-    Dilaporkan sebagai bukti kuantitatif reliabilitas anotasi (Subbab 3.9.3),
-    sekaligus bukti langsung untuk RQ4 soal subjektivitas domain ini."""
-    if not (os.path.exists(config.HUMAN_VALIDATION_FILE) and
-            os.path.exists(config.HUMAN_VALIDATION_ANNOTATOR2_FILE)):
-        print("⚠️ File anotator 1 dan/atau 2 belum lengkap.")
-        return None
-
-    df1 = pd.read_csv(config.HUMAN_VALIDATION_FILE)
-    df2 = pd.read_csv(config.HUMAN_VALIDATION_ANNOTATOR2_FILE)
-    merged = df1.merge(df2, on="review_id", suffixes=("_1", "_2"))
-    merged["human_verdict_1"] = merged["human_verdict_1"].astype(str).str.strip().str.lower()
-    merged["human_verdict_2"] = merged["human_verdict_2"].astype(str).str.strip().str.lower()
-    merged = merged[
-        merged["human_verdict_1"].isin(VALID_VERDICTS) &
-        merged["human_verdict_2"].isin(VALID_VERDICTS)
-    ]
-
-    if len(merged) == 0:
-        print("⚠️ Belum ada baris overlap yang lengkap diisi kedua anotator.")
-        return None
-
-    kappa = cohen_kappa_score(
-        merged["human_verdict_1"], merged["human_verdict_2"], labels=sorted(VALID_VERDICTS)
-    )
-    print(f"🤝 Cohen's kappa antar-anotator (n={len(merged)}): {kappa:.4f}")
-
-    pd.DataFrame([{"n_overlap": len(merged), "cohen_kappa": kappa}]).to_csv(
-        config.HUMAN_VALIDATION_KAPPA_FILE, index=False
-    )
-    print(f"💾 Disimpan -> {config.HUMAN_VALIDATION_KAPPA_FILE}")
+def compute_interannotator_kappa(ctx):
+    """Cohen's kappa biasa (tiga kategori tidak berjenjang) pada baris overlap."""
+    ctx.require_main("validasi manusia")
+    p1, p2 = _paths()["human_validation"], _paths()["human_validation_annotator2"]
+    m = pd.read_csv(p1).merge(pd.read_csv(p2), on="review_id", suffixes=("_1", "_2"))
+    for c in ("human_verdict_1", "human_verdict_2"):
+        m[c] = m[c].astype(str).str.strip().str.lower()
+    m = m[m["human_verdict_1"].isin(VALID) & m["human_verdict_2"].isin(VALID)]
+    if len(m) == 0:
+        raise ValueError("Belum ada baris overlap yang lengkap diisi kedua penilai.")
+    kappa = cohen_kappa_score(m["human_verdict_1"], m["human_verdict_2"], labels=sorted(VALID))
+    print(f"Cohen's kappa antar-penilai (n={len(m)}): {kappa:.4f}")
+    drive_io.write_once_csv(pd.DataFrame([{"n_overlap": len(m), "cohen_kappa": kappa}]),
+                            os.path.join(ctx.validation_dir, "human_validation_kappa.csv"))
     return kappa
 
 
-# ==========================================================
-# FALLBACK SATU ANOTATOR -- TEST-RETEST RELIABILITY
-# ==========================================================
-def export_retest_subset(fraction=None, seed=77):
-    """Fallback kalau hanya ada satu penilai: sebagian sample (default 10%)
-    dinilai ulang mandiri tanpa melihat verdict sebelumnya (Subbab 3.9.3)."""
+def create_retest_subset(fraction=None, seed=77):
+    """Jalur cadangan satu penilai (test-retest, Subbab 3.7)."""
     fraction = fraction or config.TEST_RETEST_FRACTION
-    if not os.path.exists(config.HUMAN_VALIDATION_FILE):
-        print("⚠️ Sample anotator pertama belum ada -- jalankan clean.py dulu.")
-        return None
-
-    df = pd.read_csv(config.HUMAN_VALIDATION_FILE)
+    p1, pr = _paths()["human_validation"], _paths()["human_validation_retest"]
+    annotation.assert_can_create(pr, "human_verdict")
+    df = pd.read_csv(p1)
     n_sub = max(1, int(round(len(df) * fraction)))
-    subset = df.drop(columns=["human_verdict", "human_note"], errors="ignore").sample(
-        n=n_sub, random_state=seed
-    )
+    subset = df.drop(columns=["human_verdict", "human_note"], errors="ignore").sample(n=n_sub, random_state=seed)
     subset["human_verdict"] = ""
     subset["human_note"] = ""
-    subset.to_csv(config.HUMAN_VALIDATION_RETEST_FILE, index=False)
-    print(f"📝 Sample uji-ulang ({n_sub} baris) -> {config.HUMAN_VALIDATION_RETEST_FILE}")
-    return config.HUMAN_VALIDATION_RETEST_FILE
+    drive_io.write_once_csv(subset, pr)
+    return pr
 
 
-def compute_test_retest_reliability():
-    if not (os.path.exists(config.HUMAN_VALIDATION_RESULT_FILE) and
-            os.path.exists(config.HUMAN_VALIDATION_RETEST_FILE)):
-        print("⚠️ File hasil final dan/atau file uji-ulang belum lengkap.")
-        return None
-
-    df1 = pd.read_csv(config.HUMAN_VALIDATION_RESULT_FILE)
-    df2 = pd.read_csv(config.HUMAN_VALIDATION_RETEST_FILE)
-    merged = df1.merge(df2, on="review_id", suffixes=("_awal", "_retest"))
-    merged["human_verdict_awal"] = merged["human_verdict_awal"].astype(str).str.strip().str.lower()
-    merged["human_verdict_retest"] = merged["human_verdict_retest"].astype(str).str.strip().str.lower()
-    merged = merged[
-        merged["human_verdict_awal"].isin(VALID_VERDICTS) &
-        merged["human_verdict_retest"].isin(VALID_VERDICTS)
-    ]
-
-    if len(merged) == 0:
-        print("⚠️ Belum ada baris uji-ulang yang lengkap.")
-        return None
-
-    kappa = cohen_kappa_score(
-        merged["human_verdict_awal"], merged["human_verdict_retest"], labels=sorted(VALID_VERDICTS)
-    )
-    print(f"🔁 Reliabilitas uji-ulang (test-retest kappa, n={len(merged)}): {kappa:.4f}")
+def compute_test_retest(ctx):
+    ctx.require_main("validasi manusia")
+    p1, pr = _paths()["human_validation"], _paths()["human_validation_retest"]
+    m = pd.read_csv(p1).merge(pd.read_csv(pr), on="review_id", suffixes=("_awal", "_retest"))
+    for c in ("human_verdict_awal", "human_verdict_retest"):
+        m[c] = m[c].astype(str).str.strip().str.lower()
+    m = m[m["human_verdict_awal"].isin(VALID) & m["human_verdict_retest"].isin(VALID)]
+    kappa = cohen_kappa_score(m["human_verdict_awal"], m["human_verdict_retest"], labels=sorted(VALID))
+    print(f"Test-retest kappa (n={len(m)}): {kappa:.4f}. Hanya mengukur konsistensi diri (bias satu penilai).")
+    drive_io.write_once_csv(pd.DataFrame([{"n": len(m), "test_retest_kappa": kappa}]),
+                            os.path.join(ctx.validation_dir, "human_validation_test_retest.csv"))
     return kappa
-
-
-if __name__ == "__main__":
-    compute_agreement()

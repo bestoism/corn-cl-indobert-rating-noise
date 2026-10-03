@@ -1,319 +1,206 @@
 """
-significance.py -- Uji signifikansi statistik (Wilcoxon Signed-Rank +
-Holm-Bonferroni) dan effect size (bootstrap CI 95%) untuk 5 hipotesis
-pre-registered (H1-H5), sesuai rumusan masalah Bab 1.3 dan rencana
-pengujian Subbab 3.9.2.
+significance.py: uji signifikansi dan effect size untuk lima hipotesis pre-registered (Subbab 3.12).
+
+Seluruh perhitungan bekerja dari berkas prediksi per sampel yang tersimpan saat pelatihan
+(predictions/{skenario}__seed{seed}.csv), bukan dari checkpoint.
+
+Tiga jalur pelaporan:
+  1. Wilcoxon Signed-Rank atas rata-rata absolute error per sampel (agregasi seed), koreksi
+     Holm-Bonferroni atas lima uji, dua arah, zero_method='zsplit'. Effect size MAE dengan CI
+     bootstrap 95 persen.
+  2. QWK ENSEMBLE (definisi utama): prediksi tiga seed dirata-rata lalu dibulatkan ke kelas
+     terdekat, selisih QWK dengan CI bootstrap 95 persen.
+  3. QWK PER SEED (analisis sensitivitas, TAMBAHAN): QWK dihitung per seed lalu dirata-rata
+     antar seed. CI bootstrap memakai indeks resampling yang sama untuk semua seed (berpasangan).
 """
 
 import os
+
 import numpy as np
 import pandas as pd
-import torch
-from torch.utils.data import DataLoader
 from scipy.stats import wilcoxon
 from statsmodels.stats.multitest import multipletests
-from sklearn.metrics import cohen_kappa_score
 
-from src import config
-from src.data import ReviewDataset
-from src.models import build_model
-from coral_pytorch.dataset import corn_label_from_logits
+from src import config, drive_io
+from src.metrics import qwk_fast
+from src.train import build_final_results_table
 
 
-# ==========================================================
-# 0. GUARD -- significance testing HARUS dijalankan dengan proxy final aktif
-# ==========================================================
-# Checkpoint model final (M1-M6) disimpan di config.MODEL_CKPT_DIR, yang
-# path-nya bergantung pada config.PROXY_NAME saat ini (lihat config.set_proxy()).
-# Kalau kamu habis eksplorasi proxy lain (P1-P3) di sesi yang sama dan
-# lupa config.set_proxy(3) sebelum menjalankan modul ini, fungsi di bawah
-# akan mencari checkpoint di folder proxy yang SALAH -- gagalnya jelas
-# (FileNotFoundError), tapi assert eksplisit ini membuat penyebabnya
-# langsung ketahuan dari pesan error, bukan perlu ditelusuri manual dulu.
-_FINAL_PROXY_ID = 3  # finetuned_corn (P4) -- proxy final sesuai Batasan Masalah
-
-
-def _assert_final_proxy_active():
-    if config.PROXY_ID != _FINAL_PROXY_ID:
-        raise RuntimeError(
-            f"Significance testing (M1-M6) harus dijalankan dengan proxy final "
-            f"aktif (PROXY_ID={_FINAL_PROXY_ID}, '{config.PROXY_REGISTRY[_FINAL_PROXY_ID]['name']}'), "
-            f"tapi proxy aktif saat ini adalah PROXY_ID={config.PROXY_ID} "
-            f"('{config.PROXY_NAME}'). Checkpoint model final (M1-M6) hanya disimpan "
-            f"di bawah folder proxy final -- kalau kamu barusan eksplorasi proxy lain "
-            f"(P1-P3) di sesi yang sama, jalankan config.set_proxy({_FINAL_PROXY_ID}) "
-            f"dulu sebelum memanggil fungsi ini."
-        )
-
-
-# ==========================================================
-# 1. KUMPULKAN PREDIKSI DARI KETIGA SEED (bukan cuma seed 42)
-# ==========================================================
-def _get_predictions_one_seed(scenario_name, loss_type, seed, test_loader):
-    model = build_model(loss_type)
-    ckpt_path = os.path.join(config.MODEL_CKPT_DIR, scenario_name, f"seed{seed}_best.pt")
-
-    if not os.path.exists(ckpt_path):
-        raise FileNotFoundError(
-            f"Checkpoint tidak ditemukan: {ckpt_path}\n"
-            f"Pastikan run_experiment('{scenario_name}', ..., seed={seed}) "
-            f"sudah selesai dijalankan sebelum uji signifikansi, DAN proxy aktif "
-            f"saat ini ({config.PROXY_NAME}) sama dengan proxy yang dipakai saat "
-            f"training M1-M6 tersebut."
-        )
-
-    model.load_state_dict(torch.load(ckpt_path, map_location=config.DEVICE))
-    model.eval()
-
-    preds = []
-    with torch.no_grad():
-        for batch in test_loader:
-            input_ids = batch["input_ids"].to(config.DEVICE)
-            attention_mask = batch["attention_mask"].to(config.DEVICE)
-            logits = model(input_ids, attention_mask)
-            p = (torch.argmax(logits, dim=1) if loss_type == "ce"
-                 else corn_label_from_logits(logits)).cpu().numpy() + 1  # kembali ke skala 1-5
-            preds.extend(p)
-
-    return np.array(preds)
-
-
-def collect_all_predictions(scenarios):
-    """
-    Mengumpulkan prediksi test set dari SEMUA seed (bukan cuma seed 42),
-    sesuai Subbab 3.9.2: uji Wilcoxon dihitung dari rata-rata absolute
-    error yang diagregasi dari tiga random seed.
-
-    Return:
-        true_labels: array label test set asli (skala 1-5)
-        preds_per_seed: dict {scenario_name: {seed: array_prediksi}}
-    """
-    _assert_final_proxy_active()
-
-    df_test = pd.read_csv(config.TEST_FILE)
-    test_loader = DataLoader(
-        ReviewDataset(df_test["cleaned_text"].tolist(), df_test["rating"].tolist()),
-        batch_size=config.BATCH_SIZE, shuffle=False,
-    )
-    true_labels = np.array(df_test["rating"].tolist())
+# ----------------------------------------------------------------------
+# Memuat prediksi tersimpan
+# ----------------------------------------------------------------------
+def load_predictions(ctx, seeds, scenarios=None):
+    scenarios = scenarios or config.SCENARIOS
+    df_test = drive_io.read_csv_verified(ctx.split_file("test"))
+    ref_ids = df_test["review_id"].astype(str).values
+    true_labels = df_test["rating"].values.astype(int)
 
     preds_per_seed = {}
     for s in scenarios:
         preds_per_seed[s["name"]] = {}
-        for seed in config.SEED_LIST:
-            print(f"   Memuat prediksi {s['name']} | seed {seed} ...")
-            preds_per_seed[s["name"]][seed] = _get_predictions_one_seed(
-                s["name"], s["loss"], seed, test_loader
-            )
+        for seed in seeds:
+            path = ctx.scenario_pred_file(s["name"], seed)
+            df = drive_io.read_csv_verified(path)
+            if not np.array_equal(df["review_id"].astype(str).values, ref_ids):
+                raise RuntimeError(f"[BERHENTI] review_id pada {path} tidak selaras dengan data uji.")
+            if not np.array_equal(df["y_true"].values.astype(int), true_labels):
+                raise RuntimeError(f"[BERHENTI] y_true pada {path} berbeda dari data uji.")
+            preds_per_seed[s["name"]][seed] = df["y_pred"].values.astype(int)
+    return true_labels, preds_per_seed, ref_ids
 
-    return true_labels, preds_per_seed
 
-
-# ==========================================================
-# 2. AGREGASI ABSOLUTE ERROR LINTAS 3 SEED
-# ==========================================================
 def aggregate_errors_across_seeds(true_labels, preds_per_seed):
-    """
-    Untuk tiap skenario, hitung absolute error per sampel PER SEED, lalu
-    rata-ratakan across seed (bukan across sampel!) -- sehingga tiap sampel
-    test set punya satu nilai error yang mewakili konsistensi model di
-    3 inisialisasi bobot berbeda. Sesuai Subbab 3.9.2: "rata-rata absolute
-    error per sampel data uji yang diagregasi dari tiga random seed".
-
-    Return: dict {scenario_name: array shape (n_test_samples,)}
-    """
-    aggregated = {}
-    for scenario_name, seed_preds in preds_per_seed.items():
-        errors_per_seed = np.stack([
-            np.abs(true_labels - preds) for preds in seed_preds.values()
-        ])
-        aggregated[scenario_name] = errors_per_seed.mean(axis=0)
-    return aggregated
+    """Absolute error per sampel per seed, dirata-rata antar seed (bukan antar sampel)."""
+    out = {}
+    for name, seed_preds in preds_per_seed.items():
+        errs = np.stack([np.abs(true_labels - p) for p in seed_preds.values()])
+        out[name] = errs.mean(axis=0)
+    return out
 
 
-# ==========================================================
-# 3. UJI SIGNIFIKANSI — 5 HIPOTESIS PRE-REGISTERED
-# ==========================================================
-PRE_REGISTERED_HYPOTHESES = [
-    ("H1_CORN_vs_CE_raw",          "M4_Baseline_CORN",      "M1_Baseline_CE"),
-    ("H2_SeverityAware_vs_Base",   "M6_CleanedSevere_CORN", "M4_Baseline_CORN"),
-    ("H3_HardPrune_vs_Base",       "M5_CleanedHard_CORN",   "M4_Baseline_CORN"),
-    ("H4_SeverityAware_vs_Hard",   "M6_CleanedSevere_CORN", "M5_CleanedHard_CORN"),
-    ("H5_SeverityAware_vs_Base_CE","M3_CleanedSevere_CE",   "M1_Baseline_CE"),
-]
-
-
-def run_significance_test(aggregated_errors, alpha=0.05):
-    """
-    Wilcoxon Signed-Rank per hipotesis pre-registered (sekarang 5),
-    dikoreksi BERSAMA dengan Holm-Bonferroni -- koreksi otomatis menghitung
-    SEMUA uji yang didaftarkan di PRE_REGISTERED_HYPOTHESES (multipletests
-    menerima daftar p-value apa adanya).
-    """
-    raw_pvalues = []
-    rows = []
-
-    for hyp_name, model_a, model_b in PRE_REGISTERED_HYPOTHESES:
-        if model_a not in aggregated_errors or model_b not in aggregated_errors:
-            raise KeyError(
-                f"Skenario '{model_a}' atau '{model_b}' tidak ditemukan di "
-                f"aggregated_errors. Pastikan semua 6 skenario sudah dilatih."
-            )
-
-        errors_a = aggregated_errors[model_a]
-        errors_b = aggregated_errors[model_b]
-
-        # zero_method='zsplit': menangani kasus error_a == error_b persis sama
-        # (umum terjadi karena rating diskrit 1-5, banyak sampel error-nya identik)
-        stat, p = wilcoxon(errors_a, errors_b, zero_method="zsplit")
-
-        raw_pvalues.append(p)
-        rows.append({
-            "hypothesis": hyp_name,
-            "model_a": model_a,
-            "model_b": model_b,
-            "mean_error_a": errors_a.mean(),
-            "mean_error_b": errors_b.mean(),
-            "p_value_raw": p,
-        })
-
-    reject, corrected_pvalues, _, _ = multipletests(raw_pvalues, alpha=alpha, method="holm")
-
-    for i, row in enumerate(rows):
-        row["p_value_corrected"] = corrected_pvalues[i]
-        row["signifikan"] = "Ya" if reject[i] else "Tidak"
-
-    results_df = pd.DataFrame(rows)
-    results_df.to_csv(config.SIGNIFICANCE_TEST_FILE, index=False)
-    print(f"\n💾 Hasil uji signifikansi (5 hipotesis, Holm-Bonferroni) -> {config.SIGNIFICANCE_TEST_FILE}")
-
-    return results_df
-
-
-# ==========================================================
-# 4. EFFECT SIZE + CI 95% (BOOTSTRAP) — PELENGKAP P-VALUE
-# ==========================================================
-def bootstrap_effect_size(aggregated_errors, model_a, model_b, n_boot=2000, seed=42):
-    """
-    Selisih mean error (model_a - model_b) + interval kepercayaan 95% lewat
-    bootstrap resampling pada data uji -- dilaporkan meski hasil tidak
-    signifikan, supaya besaran efek tetap terlihat, bukan diabaikan begitu
-    saja (Subbab 3.9.2).
-    """
-    rng = np.random.default_rng(seed)
-    errors_a = aggregated_errors[model_a]
-    errors_b = aggregated_errors[model_b]
-    n = len(errors_a)
-
-    diffs = errors_a - errors_b
-    observed_diff = diffs.mean()
-
-    boot_diffs = np.array([
-        rng.choice(diffs, size=n, replace=True).mean() for _ in range(n_boot)
-    ])
-    ci_low, ci_high = np.percentile(boot_diffs, [2.5, 97.5])
-
-    return {
-        "model_a": model_a,
-        "model_b": model_b,
-        "mean_diff": observed_diff,
-        "ci_95_low": ci_low,
-        "ci_95_high": ci_high,
-    }
-
-
-def run_all_effect_sizes(aggregated_errors):
-    rows = [
-        bootstrap_effect_size(aggregated_errors, model_a, model_b)
-        for _, model_a, model_b in PRE_REGISTERED_HYPOTHESES
-    ]
+# ----------------------------------------------------------------------
+# Wilcoxon + Holm-Bonferroni
+# ----------------------------------------------------------------------
+def run_significance_test(aggregated_errors, alpha=None):
+    alpha = config.ALPHA if alpha is None else alpha
+    raw_p, rows = [], []
+    for hyp, a, b in config.HYPOTHESES:
+        ea, eb = aggregated_errors[a], aggregated_errors[b]
+        try:
+            _, p = wilcoxon(ea, eb, zero_method="zsplit")
+        except ValueError:
+            p = 1.0  # seluruh selisih nol
+        raw_p.append(p)
+        rows.append({"hypothesis": hyp, "model_a": a, "model_b": b,
+                     "mean_error_a": float(ea.mean()), "mean_error_b": float(eb.mean()),
+                     "p_value_raw": float(p)})
+    reject, corrected, _, _ = multipletests(raw_p, alpha=alpha, method="holm")
+    for i, r in enumerate(rows):
+        r["p_value_corrected"] = float(corrected[i])
+        r["signifikan"] = "Ya" if reject[i] else "Tidak"
     return pd.DataFrame(rows)
 
 
-# ==========================================================
-# 5. CI BOOTSTRAP SELISIH QWK (METRIK UTAMA)
-# ==========================================================
-def bootstrap_qwk_difference(true_labels, preds_per_seed, model_a, model_b, n_boot=2000, seed=42):
-    """
-    QWK dihitung atas matriks konfusi agregat sehingga tidak bisa didekomposisi
-    per-sampel untuk uji Wilcoxon -- Subbab 3.9.2 mewajibkan pelaporan selisih
-    QWK lewat CI bootstrap sebagai gantinya. Prediksi diagregasi lintas 3 seed
-    via rata-rata lalu dibulatkan ke kelas terdekat (rating diskret).
-    """
+# ----------------------------------------------------------------------
+# Effect size MAE
+# ----------------------------------------------------------------------
+def bootstrap_effect_size(aggregated_errors, model_a, model_b, n_boot=None, seed=None):
+    n_boot = n_boot or config.N_BOOT
+    seed = config.BOOT_SEED if seed is None else seed
+    rng = np.random.default_rng(seed)
+    diffs = aggregated_errors[model_a] - aggregated_errors[model_b]
+    n = len(diffs)
+    boot = np.array([rng.choice(diffs, size=n, replace=True).mean() for _ in range(n_boot)])
+    lo, hi = np.percentile(boot, [2.5, 97.5])
+    return {"model_a": model_a, "model_b": model_b, "mean_diff": float(diffs.mean()),
+            "ci_95_low": float(lo), "ci_95_high": float(hi)}
+
+
+def run_all_effect_sizes(aggregated_errors):
+    rows = []
+    for hyp, a, b in config.HYPOTHESES:
+        rows.append({"hypothesis": hyp, **bootstrap_effect_size(aggregated_errors, a, b)})
+    return pd.DataFrame(rows)
+
+
+# ----------------------------------------------------------------------
+# QWK ensemble dan per seed
+# ----------------------------------------------------------------------
+def ensemble_predictions(seed_preds):
+    """Rata-rata prediksi antar seed, dibulatkan ke kelas terdekat, dibatasi 1 sampai 5."""
+    stacked = np.stack(list(seed_preds.values()))
+    return np.clip(np.round(stacked.mean(axis=0)), 1, 5).astype(int)
+
+
+def bootstrap_qwk_ensemble(true_labels, preds_per_seed, model_a, model_b, n_boot=None, seed=None):
+    n_boot = n_boot or config.N_BOOT
+    seed = config.BOOT_SEED if seed is None else seed
     rng = np.random.default_rng(seed)
     n = len(true_labels)
-
-    preds_a = np.clip(np.round(np.mean(np.stack(list(preds_per_seed[model_a].values())), axis=0)), 1, 5).astype(int)
-    preds_b = np.clip(np.round(np.mean(np.stack(list(preds_per_seed[model_b].values())), axis=0)), 1, 5).astype(int)
-
-    def _qwk(y_true, y_pred):
-        return cohen_kappa_score(y_true, y_pred, weights="quadratic")
-
-    qwk_a = _qwk(true_labels, preds_a)
-    qwk_b = _qwk(true_labels, preds_b)
-    observed_diff = qwk_a - qwk_b
-
+    pa, pb = ensemble_predictions(preds_per_seed[model_a]), ensemble_predictions(preds_per_seed[model_b])
+    qa, qb = qwk_fast(true_labels, pa), qwk_fast(true_labels, pb)
     idx_all = np.arange(n)
-    boot_diffs = np.array([
-        _qwk(true_labels[idx], preds_a[idx]) - _qwk(true_labels[idx], preds_b[idx])
-        for idx in (rng.choice(idx_all, size=n, replace=True) for _ in range(n_boot))
-    ])
-    ci_low, ci_high = np.percentile(boot_diffs, [2.5, 97.5])
-
-    return {
-        "model_a": model_a,
-        "model_b": model_b,
-        "qwk_a": qwk_a,
-        "qwk_b": qwk_b,
-        "qwk_diff": observed_diff,
-        "ci_95_low": ci_low,
-        "ci_95_high": ci_high,
-    }
-
-
-def run_all_qwk_effect_sizes(true_labels, preds_per_seed):
-    return pd.DataFrame([
-        bootstrap_qwk_difference(true_labels, preds_per_seed, a, b)
-        for _, a, b in PRE_REGISTERED_HYPOTHESES
-    ])
-    
-# ==========================================================
-# 6. ANALISIS SENSITIVITAS: QWK PER-SEED (pelengkap, bukan pengganti definisi utama §3.12)
-# ==========================================================
-def _qwk_fast(y_true, y_pred, k=5):
-    cm = np.bincount((y_true - 1) * k + (y_pred - 1), minlength=k * k).reshape(k, k).astype(float)
-    w = (np.arange(k)[:, None] - np.arange(k)[None, :]) ** 2 / (k - 1) ** 2
-    exp = np.outer(cm.sum(1), cm.sum(0)) / cm.sum()
-    return 1 - (w * cm).sum() / (w * exp).sum()
-
-
-def bootstrap_qwk_difference_per_seed(true_labels, preds_per_seed, model_a, model_b, n_boot=2000, seed=42):
-    """
-    Estimand = selisih rata-rata QWK PER-SEED (konsisten dengan tabel mean±std), BUKAN QWK dari
-    prediksi ensemble. Dilaporkan berdampingan dengan versi ensemble di bootstrap_qwk_difference().
-    """
-    rng = np.random.default_rng(seed)
-    y = np.asarray(true_labels).astype(int)
-    n = len(y)
-    A = [np.asarray(p).astype(int) for p in preds_per_seed[model_a].values()]
-    B = [np.asarray(p).astype(int) for p in preds_per_seed[model_b].values()]
-
-    def mean_qwk(P, idx):
-        return float(np.mean([_qwk_fast(y[idx], p[idx]) for p in P]))
-
-    full = np.arange(n)
-    qa, qb = mean_qwk(A, full), mean_qwk(B, full)
-    boots = np.empty(n_boot)
+    boot = np.empty(n_boot)
     for i in range(n_boot):
-        idx = rng.integers(0, n, n)
-        boots[i] = mean_qwk(A, idx) - mean_qwk(B, idx)
-    lo, hi = np.percentile(boots, [2.5, 97.5])
+        idx = rng.choice(idx_all, size=n, replace=True)
+        boot[i] = qwk_fast(true_labels[idx], pa[idx]) - qwk_fast(true_labels[idx], pb[idx])
+    lo, hi = np.percentile(boot, [2.5, 97.5])
     return {"model_a": model_a, "model_b": model_b, "qwk_a": qa, "qwk_b": qb,
-            "qwk_diff": qa - qb, "ci_95_low": lo, "ci_95_high": hi}
+            "qwk_diff": qa - qb, "ci_95_low": float(lo), "ci_95_high": float(hi)}
 
 
-def run_all_qwk_per_seed(true_labels, preds_per_seed):
-    return pd.DataFrame([
-        bootstrap_qwk_difference_per_seed(true_labels, preds_per_seed, a, b)
-        for _, a, b in PRE_REGISTERED_HYPOTHESES
-    ])
+def bootstrap_qwk_per_seed(true_labels, preds_per_seed, model_a, model_b, n_boot=None, seed=None):
+    n_boot = n_boot or config.N_BOOT
+    seed = config.BOOT_SEED if seed is None else seed
+    rng = np.random.default_rng(seed)
+    n = len(true_labels)
+    seeds = list(preds_per_seed[model_a].keys())
+    qa = np.array([qwk_fast(true_labels, preds_per_seed[model_a][s]) for s in seeds])
+    qb = np.array([qwk_fast(true_labels, preds_per_seed[model_b][s]) for s in seeds])
+    idx_all = np.arange(n)
+    boot = np.empty(n_boot)
+    for i in range(n_boot):
+        idx = rng.choice(idx_all, size=n, replace=True)
+        yt = true_labels[idx]
+        boot[i] = np.mean([qwk_fast(yt, preds_per_seed[model_a][s][idx]) -
+                           qwk_fast(yt, preds_per_seed[model_b][s][idx]) for s in seeds])
+    lo, hi = np.percentile(boot, [2.5, 97.5])
+    row = {"model_a": model_a, "model_b": model_b, "n_seed": len(seeds),
+           "qwk_a_rata_seed": float(qa.mean()), "qwk_b_rata_seed": float(qb.mean()),
+           "qwk_diff": float((qa - qb).mean()), "ci_95_low": float(lo), "ci_95_high": float(hi)}
+    for s, d in zip(seeds, qa - qb):
+        row[f"qwk_diff_seed{s}"] = float(d)
+    return row
+
+
+def run_all_qwk(true_labels, preds_per_seed):
+    ens = pd.DataFrame([{"hypothesis": h, **bootstrap_qwk_ensemble(true_labels, preds_per_seed, a, b)}
+                        for h, a, b in config.HYPOTHESES])
+    per = pd.DataFrame([{"hypothesis": h, **bootstrap_qwk_per_seed(true_labels, preds_per_seed, a, b)}
+                        for h, a, b in config.HYPOTHESES])
+    return ens, per
+
+
+# ----------------------------------------------------------------------
+# Tabel panjang untuk aturan konsistensi
+# ----------------------------------------------------------------------
+def build_long_table(split_seed, n_weight_seeds, sig_df, eff_df, qwk_ens_df, qwk_per_df):
+    rows = []
+    sig = sig_df.set_index("hypothesis")
+    for _, r in eff_df.iterrows():
+        s = sig.loc[r["hypothesis"]]
+        rows.append({"split_seed": split_seed, "hypothesis": r["hypothesis"], "metric": "MAE",
+                     "model_a": r["model_a"], "model_b": r["model_b"], "diff": r["mean_diff"],
+                     "ci_low": r["ci_95_low"], "ci_high": r["ci_95_high"],
+                     "n_weight_seeds": n_weight_seeds, "wilcoxon_p_raw": s["p_value_raw"],
+                     "wilcoxon_p_holm": s["p_value_corrected"], "wilcoxon_signifikan": s["signifikan"]})
+    for metric, df in (("QWK_ensemble", qwk_ens_df), ("QWK_per_seed", qwk_per_df)):
+        for _, r in df.iterrows():
+            rows.append({"split_seed": split_seed, "hypothesis": r["hypothesis"], "metric": metric,
+                         "model_a": r["model_a"], "model_b": r["model_b"], "diff": r["qwk_diff"],
+                         "ci_low": r["ci_95_low"], "ci_high": r["ci_95_high"],
+                         "n_weight_seeds": n_weight_seeds, "wilcoxon_p_raw": np.nan,
+                         "wilcoxon_p_holm": np.nan, "wilcoxon_signifikan": ""})
+    return pd.DataFrame(rows)
+
+
+def run_significance_suite(ctx, seeds):
+    """Menjalankan seluruh analisis untuk satu split dan menulis tabel unik ke significance_dir."""
+    true_labels, preds, _ = load_predictions(ctx, seeds)
+    agg = aggregate_errors_across_seeds(true_labels, preds)
+
+    final_table = build_final_results_table(ctx, seeds)
+    sig = run_significance_test(agg)
+    eff = run_all_effect_sizes(agg)
+    qwk_ens, qwk_per = run_all_qwk(true_labels, preds)
+    long = build_long_table(ctx.split_seed, len(seeds), sig, eff, qwk_ens, qwk_per)
+
+    d = ctx.significance_dir
+    drive_io.write_once_csv(final_table, os.path.join(d, "final_results_table.csv"))
+    drive_io.write_once_csv(sig, os.path.join(d, "significance_test.csv"))
+    drive_io.write_once_csv(eff, os.path.join(d, "effect_sizes_mae.csv"))
+    drive_io.write_once_csv(qwk_ens, os.path.join(d, "qwk_ensemble_effect.csv"))
+    drive_io.write_once_csv(qwk_per, os.path.join(d, "qwk_per_seed_effect.csv"))
+    drive_io.write_once_csv(long, os.path.join(d, "tabel_panjang_efek.csv"))
+    return {"final": final_table, "sig": sig, "eff": eff, "qwk_ens": qwk_ens,
+            "qwk_per": qwk_per, "long": long}

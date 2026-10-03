@@ -1,229 +1,254 @@
 """
-config.py -- Konfigurasi terpusat. Satu skema data (all_reviews_master.csv dikunci),
-satu backbone (IndoBERT). Mendukung analisis sensitivitas split lewat set_split().
-Split utama (seed 42) memakai path lama; split lain masuk subfolder 'split<seed>'.
+config.py: konfigurasi terpusat.
+
+Prinsip penyimpanan (Subbab 3.13 dan catatan ketahanan Drive):
+  - Drive hanya berisi berkas unik yang ditulis sekali (lihat drive_io.py).
+  - Tidak ada folder per skenario. Seluruh berkas per skenario dan seed memakai
+    nama datar, misalnya M4_Baseline_CORN__seed42.json, pada folder yang dibuat
+    sekali di awal.
+  - Checkpoint model (sekitar 500 MB) ditulis ke disk lokal Colab (LOCAL_ROOT).
+
+Struktur folder keluaran per split partisi (seragam untuk split utama dan
+sensitivitas):
+  runs/split_seed{S}/{data,proxy,ablation,diagnostics,noise,cleaned,
+                      training,predictions,significance,validation,
+                      gold,k_sensitivity}
+Folder ablation, validation, gold, dan k_sensitivity hanya terisi pada split
+utama (seed partisi 42).
 """
+
 import os
 import sys
-import torch
 
-# ==========================================================
-# 1. LINGKUNGAN & PATH DASAR
-# ==========================================================
-IN_COLAB = 'google.colab' in sys.modules
-DRIVE_FOLDER_NAME = "SKRIPSI_CORN_CL_FINAL"
+IN_COLAB = "google.colab" in sys.modules
 
-if IN_COLAB:
-    DRIVE_ROOT = os.environ.get("SKRIPSI_DRIVE_ROOT", f"/content/drive/MyDrive/{DRIVE_FOLDER_NAME}")
-else:
-    DRIVE_ROOT = os.environ.get(
-        "SKRIPSI_DRIVE_ROOT",
-        os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "local_data"),
-    )
+_DEFAULT_COLAB_ROOT = "/content/drive/MyDrive/SKRIPSI_CORN_CL_FINAL"
+_DEFAULT_LOCAL_ROOT = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "local_data"
+)
 
-# Direktori PRIMER (split utama, seed 42)
-DATA_RAW_DIR = os.path.join(DRIVE_ROOT, "data", "raw")
-PRIMARY_DATA_PROCESSED_DIR = os.path.join(DRIVE_ROOT, "data", "processed")
-PRIMARY_PROXY_CACHE_DIR = os.path.join(DRIVE_ROOT, "proxy_cache")
-PRIMARY_CLEANED_DIR = os.path.join(DRIVE_ROOT, "cleaned")
-PRIMARY_MODEL_CKPT_ROOT = os.path.join(DRIVE_ROOT, "models_ckpt")
-PRIMARY_HUMAN_VALIDATION_DIR = os.path.join(DRIVE_ROOT, "human_validation")
-PRIMARY_RESULTS_DIR = os.path.join(DRIVE_ROOT, "results")
-PRIMARY_LOGS_DIR = os.path.join(DRIVE_ROOT, "logs")
-GOLD_TEST_DIR = os.path.join(DRIVE_ROOT, "gold_test")  # hanya split utama
+DRIVE_ROOT = os.environ.get(
+    "SKRIPSI_DRIVE_ROOT", _DEFAULT_COLAB_ROOT if IN_COLAB else _DEFAULT_LOCAL_ROOT
+)
+LOCAL_ROOT = os.environ.get("SKRIPSI_LOCAL_ROOT", "/content/local_work" if IN_COLAB else os.path.join(_DEFAULT_LOCAL_ROOT, "_local_work"))
 
-for d in [DATA_RAW_DIR, PRIMARY_DATA_PROCESSED_DIR, PRIMARY_PROXY_CACHE_DIR, PRIMARY_CLEANED_DIR,
-          PRIMARY_MODEL_CKPT_ROOT, PRIMARY_HUMAN_VALIDATION_DIR, PRIMARY_RESULTS_DIR,
-          PRIMARY_LOGS_DIR, GOLD_TEST_DIR]:
-    os.makedirs(d, exist_ok=True)
+GITHUB_REPO_URL = "https://github.com/bestoism/corn-cl-indobert-rating-noise"
 
-# ==========================================================
-# 2. FILE DATA TETAP (dibagi bersama oleh semua split)
-# ==========================================================
-RAW_DATA_FILE = os.path.join(DATA_RAW_DIR, "all_reviews_master.csv")
-CLEAN_TEXT_FILE = os.path.join(PRIMARY_DATA_PROCESSED_DIR, "reviews_clean.csv")
-MANIFEST_FILE = os.path.join(PRIMARY_RESULTS_DIR, "dataset_manifest.json")
+# ----------------------------------------------------------------------
+# Penguncian korpus (Subbab 3.2 dan Batasan Masalah, butir pengendalian mutu)
+# Nilai ini ditulis di kode, bukan dibaca dari manifest hasil run.
+# ----------------------------------------------------------------------
+EXPECTED_MASTER_SHA256 = "c589b92cbe2fbc34d67e43a0a866a281cb31603a190af4517ef7f157e54589f6"
+EXPECTED_MASTER_ROWS = 16740
 
-# ==========================================================
-# 3. BACKBONE
-# ==========================================================
-PRETRAINED_MODEL_NAME = "indobenchmark/indobert-base-p1"
+MIN_CORAL_PYTORCH_VERSION = "1.3.0"
 
-# ==========================================================
-# 4. REGISTRY PROXY (P1-P4, Tabel 3.1)
-# ==========================================================
-PROXY_REGISTRY = {
-    0: {"name": "frozen_cls_lr",      "desc": "CLS embedding beku + Logistic Regression (P1)"},
-    1: {"name": "frozen_meanpool_lr", "desc": "Mean-pooling embedding beku + Logistic Regression (P2)"},
-    2: {"name": "finetuned_ce",       "desc": "IndoBERT fine-tuned K-Fold, CE loss (P3)"},
-    3: {"name": "finetuned_corn",     "desc": "IndoBERT fine-tuned K-Fold, CORN loss (P4) -- DEFAULT/FINAL"},
+# ----------------------------------------------------------------------
+# Folder tingkat atas di Drive
+# ----------------------------------------------------------------------
+RAW_DIR = os.path.join(DRIVE_ROOT, "data", "raw")
+MASTER_FILE = os.path.join(RAW_DIR, "all_reviews_master.csv")
+LEXICON_DIR = os.path.join(DRIVE_ROOT, "lexicon")
+SLANG_BASE_FILE = os.path.join(LEXICON_DIR, "slang_base.csv")
+SLANG_DOMAIN_FILE = os.path.join(LEXICON_DIR, "slang_domain.csv")  # opsional
+
+PRESERVED_DIR = os.path.join(DRIVE_ROOT, "preserved")
+ANNOT_DIR = os.path.join(DRIVE_ROOT, "annotations")
+
+SHARED_DIR = os.path.join(DRIVE_ROOT, "shared")
+SHARED_PROCESSED_DIR = os.path.join(SHARED_DIR, "processed")
+SHARED_RESULTS_DIR = os.path.join(SHARED_DIR, "results")
+QUALITY_DIR = os.path.join(SHARED_RESULTS_DIR, "quality")
+SENSITIVITY_SUMMARY_DIR = os.path.join(SHARED_RESULTS_DIR, "sensitivity_partisi")
+LOGS_DIR = os.path.join(DRIVE_ROOT, "logs")
+RUNS_DIR = os.path.join(DRIVE_ROOT, "runs")
+
+CLEAN_TEXT_FILE = os.path.join(SHARED_PROCESSED_DIR, "reviews_clean.csv")
+
+# Berkas yang dipertahankan (tidak dapat dibuat ulang dari raw dan lexicon)
+PRESERVED_FILES = [
+    os.path.join(PRESERVED_DIR, "scraping_summary.csv"),
+    os.path.join(PRESERVED_DIR, "dataset_manifest_original.json"),
+]
+ANNOT_FILES = {
+    "human_validation": os.path.join(ANNOT_DIR, "human_validation_sample.csv"),
+    "human_validation_annotator2": os.path.join(ANNOT_DIR, "human_validation_sample_annotator2.csv"),
+    "human_validation_retest": os.path.join(ANNOT_DIR, "human_validation_sample_retest.csv"),
+    "gold": os.path.join(ANNOT_DIR, "gold_test_sample.csv"),
+    "gold_annotator2": os.path.join(ANNOT_DIR, "gold_test_sample_annotator2.csv"),
 }
-PROXY_ID = 3
 
+# ----------------------------------------------------------------------
+# Split partisi (Subbab 3.4)
+# ----------------------------------------------------------------------
+MAIN_SPLIT_SEED = 42
+SPLIT_SEEDS = [42, 123, 2024]
+TEST_SIZE = 0.20
+VAL_SIZE = 0.10
 
-def set_proxy(proxy_id, verbose=True):
-    """Ganti proxy aktif. Pakai config.set_proxy(pid), JANGAN importlib.reload(config)."""
-    global PROXY_ID, PROXY_NAME, PROXY_DESC
-    global PROXY_PRED_PROBS_FILE, PROXY_PRED_PROBS_META_FILE
-    global TRAIN_CLEANED_HARD_FILE, TRAIN_CLEANED_SEVERE_FILE, MODEL_CKPT_DIR
-    global HUMAN_VALIDATION_FILE, HUMAN_VALIDATION_INTERNAL_FILE
-    global HUMAN_VALIDATION_ANNOTATOR2_FILE, HUMAN_VALIDATION_RESULT_FILE
-    global HUMAN_VALIDATION_KAPPA_FILE, HUMAN_VALIDATION_RETEST_FILE
-
-    if proxy_id not in PROXY_REGISTRY:
-        raise ValueError(f"PROXY_ID tidak dikenal: {proxy_id} (harus salah satu dari {sorted(PROXY_REGISTRY)})")
-
-    PROXY_ID = proxy_id
-    PROXY_NAME = PROXY_REGISTRY[proxy_id]["name"]
-    PROXY_DESC = PROXY_REGISTRY[proxy_id]["desc"]
-
-    PROXY_PRED_PROBS_FILE = os.path.join(PROXY_CACHE_DIR, f"oof_pred_probs__{PROXY_NAME}.npy")
-    PROXY_PRED_PROBS_META_FILE = os.path.join(PROXY_CACHE_DIR, f"oof_pred_probs_meta__{PROXY_NAME}.csv")
-    TRAIN_CLEANED_HARD_FILE = os.path.join(CLEANED_DIR, f"train_cleaned_hard__{PROXY_NAME}.csv")
-    TRAIN_CLEANED_SEVERE_FILE = os.path.join(CLEANED_DIR, f"train_cleaned_severe__{PROXY_NAME}.csv")
-    MODEL_CKPT_DIR = os.path.join(MODEL_CKPT_ROOT, PROXY_NAME)
-    os.makedirs(MODEL_CKPT_DIR, exist_ok=True)
-
-    HUMAN_VALIDATION_FILE = os.path.join(HUMAN_VALIDATION_DIR, f"human_validation_sample__{PROXY_NAME}.csv")
-    HUMAN_VALIDATION_INTERNAL_FILE = os.path.join(HUMAN_VALIDATION_DIR, f"human_validation_internal__{PROXY_NAME}.csv")
-    HUMAN_VALIDATION_ANNOTATOR2_FILE = os.path.join(HUMAN_VALIDATION_DIR, f"human_validation_sample__{PROXY_NAME}__annotator2.csv")
-    HUMAN_VALIDATION_RETEST_FILE = os.path.join(HUMAN_VALIDATION_DIR, f"human_validation_sample__{PROXY_NAME}__retest.csv")
-    HUMAN_VALIDATION_RESULT_FILE = os.path.join(HUMAN_VALIDATION_DIR, f"human_validation_result__{PROXY_NAME}.csv")
-    HUMAN_VALIDATION_KAPPA_FILE = os.path.join(HUMAN_VALIDATION_DIR, f"human_validation_kappa__{PROXY_NAME}.csv")
-
-    if verbose:
-        print(f"📌 Proxy aktif: [{PROXY_ID}] {PROXY_NAME} — {PROXY_DESC}")
-
-
-# ==========================================================
-# 5. MODEL & HYPERPARAMETER (Tabel 3.3)
-# ==========================================================
+# ----------------------------------------------------------------------
+# Backbone dan hiperparameter (Tabel 3.3)
+# ----------------------------------------------------------------------
+PRETRAINED_MODEL_NAME = "indobenchmark/indobert-base-p1"
 MAX_LEN = 128
 BATCH_SIZE = 16
 LEARNING_RATE = 2e-5
+WEIGHT_DECAY = 0.01
+WARMUP_FRACTION = 0.10
 NUM_CLASSES = 5
 EPOCHS = 10
-SEED_LIST = [42, 123, 2024]          # seed BOBOT/inisialisasi (bukan seed split)
 PATIENCE = 3
+DROPOUT = 0.3
+WEIGHT_SEEDS = [42, 123, 2024]
+WEIGHT_SEEDS_LIGHT = [42]  # opsi hemat, wajib dinyatakan sebagai keterbatasan
 
+# Proxy classifier (Subbab 3.5, 3.9)
 PROXY_CV_FOLDS = 5
+PROXY_CV_SEED = 42
 PROXY_FINETUNE_EPOCHS = 3
 PROXY_FINETUNE_LR = 2e-5
-K_SENSITIVITY_VALUES = [3, 5, 10]    # §3.5
+PROXY_INNER_CALIB_FRACTION = 0.1
+K_SENSITIVITY_VALUES = [3, 5, 10]
 
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+PROXY_REGISTRY = {
+    0: {"name": "frozen_cls_lr", "label": "P1", "loss": None,
+        "desc": "Embedding beku token [CLS] + Logistic Regression terkalibrasi"},
+    1: {"name": "frozen_meanpool_lr", "label": "P2", "loss": None,
+        "desc": "Embedding beku mean-pooling + Logistic Regression terkalibrasi"},
+    2: {"name": "finetuned_ce", "label": "P3", "loss": "ce",
+        "desc": "IndoBERT fine-tuned K-Fold, Cross-Entropy, temperature scaling"},
+    3: {"name": "finetuned_corn", "label": "P4", "loss": "corn",
+        "desc": "IndoBERT fine-tuned K-Fold, CORN, temperature scaling (proxy final)"},
+}
+FINAL_PROXY_ID = 3
 
-# ==========================================================
-# 6. FAST DEV MODE
-# ==========================================================
-DEBUG_MODE = os.environ.get("SKRIPSI_DEBUG", "0") == "1"
-DEBUG_SAMPLE_SIZE = 600
-DEBUG_EPOCHS = 2
-DEBUG_CV_FOLDS = 2
-DEBUG_SEED_LIST = [42]
-
-if DEBUG_MODE:
-    EPOCHS = DEBUG_EPOCHS
-    PROXY_CV_FOLDS = DEBUG_CV_FOLDS
-    SEED_LIST = DEBUG_SEED_LIST
-    print(f"⚠️  SKRIPSI_DEBUG=1 AKTIF — subset {DEBUG_SAMPLE_SIZE} baris, {EPOCHS} epoch, seed {SEED_LIST}")
-    print("    HASIL DI MODE INI TIDAK BOLEH DIPAKAI UNTUK LAPORAN.")
-
-# ==========================================================
-# 7. SPLIT, CLEANING, SEVERITY
-# ==========================================================
-TEST_SIZE = 0.20
-VAL_SIZE = 0.10
+# Confident learning (Subbab 3.6, 3.8)
 CLEANLAB_FILTER_METHODS = ["confident_learning", "prune_by_noise_rate"]
+MIN_EXAMPLES_PER_CLASS = 20
 SEVERITY_THRESHOLD = 2
 
-# ==========================================================
-# 8. VALIDASI MANUSIA (§3.7) -- hanya split utama
-# ==========================================================
-HUMAN_VALIDATION_N = 100
+# Kalibrasi (Subbab 2.1.8, 3.6)
+ECE_N_BINS = 10
+PROB_FLOOR = 1e-8
+
+# Validasi manusia (Subbab 3.7)
+COCHRAN_Z = 1.96
+COCHRAN_P = 0.5
+COCHRAN_E = 0.10
+HUMAN_VALIDATION_N = 100          # angka perencanaan (dibulatkan dari hasil Cochran)
+MIN_PER_SEVERE_BIN = 15
+SEVERE_BINS = (2, 3, 4)
 SECOND_ANNOTATOR_FRACTION = 0.3
 TEST_RETEST_FRACTION = 0.10
+HUMAN_VERDICTS = ("noise", "not_noise", "ambiguous")
 
-# ==========================================================
-# 9. SUBSET UJI EMAS (§3.10) -- hanya split utama
-# ==========================================================
-GOLD_TEST_MARGIN_ERROR = 0.10
-GOLD_TEST_SAMPLE_FILE = os.path.join(GOLD_TEST_DIR, "gold_test_sample.csv")
-GOLD_TEST_RESULT_FILE = os.path.join(GOLD_TEST_DIR, "gold_test_sample.csv")
-GOLD_TEST_RUBRIC_FILE = os.path.join(GOLD_TEST_DIR, "gold_test_rubric.md")
-GOLD_TEST_EVAL_FILE = os.path.join(PRIMARY_RESULTS_DIR, "gold_test_evaluation.csv")
-GOLD_TEST_EFFECT_SIZE_FILE = os.path.join(PRIMARY_RESULTS_DIR, "gold_test_effect_sizes.csv")
+# Uji emas (Subbab 3.10)
+GOLD_MARGIN_ERROR = 0.10
+GOLD_SAMPLE_SEED = 42
+GOLD_SECOND_ANNOTATOR_SEED = 99
+UNDETERMINED_LABEL = "ND"
 
-# ==========================================================
-# 10. FILE HASIL KHUSUS SPLIT UTAMA
-# ==========================================================
-K_SENSITIVITY_FILE = os.path.join(PRIMARY_RESULTS_DIR, "proxy_k_sensitivity.csv")
+# Bootstrap (Subbab 3.12)
+N_BOOT = 2000
+BOOT_SEED = 42
+ALPHA = 0.05
 
-# ==========================================================
-# 11. SENSITIVITAS SPLIT (seed PARTISI data; beda dari SEED_LIST)
-# ==========================================================
-PRIMARY_SPLIT_SEED = 42
-SPLIT_SEEDS = [42, 123, 2024]
-SPLIT_SEED = PRIMARY_SPLIT_SEED
-SPLIT_TAG = ""
+# ----------------------------------------------------------------------
+# Enam skenario (Tabel 3.2) dan lima hipotesis (Tabel 3.4)
+# ----------------------------------------------------------------------
+SCENARIOS = [
+    {"name": "M1_Baseline_CE", "variant": "raw", "loss": "ce"},
+    {"name": "M2_CleanedHard_CE", "variant": "hard", "loss": "ce"},
+    {"name": "M3_CleanedSevere_CE", "variant": "severe", "loss": "ce"},
+    {"name": "M4_Baseline_CORN", "variant": "raw", "loss": "corn"},
+    {"name": "M5_CleanedHard_CORN", "variant": "hard", "loss": "corn"},
+    {"name": "M6_CleanedSevere_CORN", "variant": "severe", "loss": "corn"},
+]
+HYPOTHESES = [
+    ("H1_CORN_vs_CE_raw", "M4_Baseline_CORN", "M1_Baseline_CE"),
+    ("H2_SeverityAware_vs_Base", "M6_CleanedSevere_CORN", "M4_Baseline_CORN"),
+    ("H3_HardPrune_vs_Base", "M5_CleanedHard_CORN", "M4_Baseline_CORN"),
+    ("H4_SeverityAware_vs_Hard", "M6_CleanedSevere_CORN", "M5_CleanedHard_CORN"),
+    ("H5_SeverityAware_vs_Base_CE", "M3_CleanedSevere_CE", "M1_Baseline_CE"),
+]
 
 
-def set_split(split_seed, verbose=True):
-    """
-    Split 42 = path lama (tidak berubah). Split lain -> subfolder 'split<seed>' pada
-    data/processed, proxy_cache, cleaned, models_ckpt, human_validation, results, logs.
-    RAW_DATA_FILE, CLEAN_TEXT_FILE, lexicon, dan semua path gold test dibagi bersama.
-    """
-    global SPLIT_SEED, SPLIT_TAG
-    global DATA_PROCESSED_DIR, PROXY_CACHE_DIR, CLEANED_DIR, MODEL_CKPT_ROOT
-    global HUMAN_VALIDATION_DIR, RESULTS_DIR, LOGS_DIR
-    global TRAIN_RAW_FILE, VAL_FILE, TEST_FILE, TRAIN_RAW_RESOLVED_FILE
-    global EMBEDDING_CACHE_FILE_BASE, EMBEDDING_CACHE_META_FILE_BASE
-    global PROXY_QUALITY_LOG_FILE, FINAL_RESULTS_TABLE_FILE
-    global SIGNIFICANCE_TEST_FILE, NOISE_SAMPLES_FILE, PROGRESS_FILE
+class RunPaths:
+    """Kumpulan path untuk satu split partisi. Semua folder dibuat sekali di awal."""
 
-    SPLIT_SEED = split_seed
-    SPLIT_TAG = "" if split_seed == PRIMARY_SPLIT_SEED else f"split{split_seed}"
+    SUBDIRS = ["data", "proxy", "ablation", "diagnostics", "noise", "cleaned",
+               "training", "predictions", "significance", "validation", "gold",
+               "k_sensitivity"]
 
-    def _d(primary):
-        return os.path.join(primary, SPLIT_TAG) if SPLIT_TAG else primary
+    def __init__(self, split_seed):
+        if split_seed not in SPLIT_SEEDS:
+            raise ValueError(f"split_seed harus salah satu dari {SPLIT_SEEDS}, dapat {split_seed}")
+        self.split_seed = split_seed
+        self.is_main = split_seed == MAIN_SPLIT_SEED
+        self.root = os.path.join(RUNS_DIR, f"split_seed{split_seed}")
+        for sub in self.SUBDIRS:
+            setattr(self, f"{sub}_dir", os.path.join(self.root, sub))
+        self.local_dir = os.path.join(LOCAL_ROOT, f"split_seed{split_seed}")
+        self.local_ckpt_dir = os.path.join(self.local_dir, "ckpt")
+        self.local_cache_dir = os.path.join(self.local_dir, "cache")
 
-    DATA_PROCESSED_DIR = _d(PRIMARY_DATA_PROCESSED_DIR)
-    PROXY_CACHE_DIR = _d(PRIMARY_PROXY_CACHE_DIR)
-    CLEANED_DIR = _d(PRIMARY_CLEANED_DIR)
-    MODEL_CKPT_ROOT = _d(PRIMARY_MODEL_CKPT_ROOT)
-    HUMAN_VALIDATION_DIR = _d(PRIMARY_HUMAN_VALIDATION_DIR)
-    RESULTS_DIR = _d(PRIMARY_RESULTS_DIR)
-    LOGS_DIR = _d(PRIMARY_LOGS_DIR)
-    for d in [DATA_PROCESSED_DIR, PROXY_CACHE_DIR, CLEANED_DIR, MODEL_CKPT_ROOT,
-              HUMAN_VALIDATION_DIR, RESULTS_DIR, LOGS_DIR]:
+    def all_dirs(self):
+        return [self.root] + [getattr(self, f"{s}_dir") for s in self.SUBDIRS]
+
+    def require_main(self, komponen):
+        if not self.is_main:
+            raise ValueError(
+                f"[BERHENTI] Komponen '{komponen}' hanya boleh dijalankan pada split utama "
+                f"(seed partisi {MAIN_SPLIT_SEED}), tetapi split aktif adalah seed {self.split_seed}. "
+                f"Ablasi P1 sampai P3, sensitivitas K, validasi manusia, dan uji emas tidak diulang "
+                f"per split karena anotasi manual tidak dapat diulang (Subbab 3.4)."
+            )
+
+    # berkas data
+    def split_file(self, name):
+        return os.path.join(self.data_dir, f"split_{name}.csv")
+
+    def variant_file(self, variant):
+        return os.path.join(self.cleaned_dir, f"train_{variant}.csv")
+
+    def scenario_pred_file(self, scenario, seed):
+        return os.path.join(self.predictions_dir, f"{scenario}__seed{seed}.csv")
+
+    def scenario_metrics_file(self, scenario, seed):
+        return os.path.join(self.training_dir, f"{scenario}__seed{seed}.json")
+
+    def local_ckpt(self, scenario, seed):
+        return os.path.join(self.local_ckpt_dir, f"{scenario}__seed{seed}_best.pt")
+
+
+def all_shared_dirs():
+    return [SHARED_DIR, SHARED_PROCESSED_DIR, SHARED_RESULTS_DIR, QUALITY_DIR,
+            SENSITIVITY_SUMMARY_DIR, LOGS_DIR, RUNS_DIR, ANNOT_DIR, PRESERVED_DIR]
+
+
+def ensure_all_dirs(split_seeds=None):
+    """Membuat seluruh folder yang dibutuhkan, sekali di awal eksekusi."""
+    split_seeds = split_seeds or SPLIT_SEEDS
+    dirs = list(all_shared_dirs())
+    for s in split_seeds:
+        dirs += RunPaths(s).all_dirs()
+    for d in dirs:
         os.makedirs(d, exist_ok=True)
-
-    TRAIN_RAW_FILE = os.path.join(DATA_PROCESSED_DIR, "split_train_raw.csv")
-    VAL_FILE = os.path.join(DATA_PROCESSED_DIR, "split_val.csv")
-    TEST_FILE = os.path.join(DATA_PROCESSED_DIR, "split_test.csv")
-    TRAIN_RAW_RESOLVED_FILE = os.path.join(CLEANED_DIR, "train_resolved.csv")
-    NOISE_SAMPLES_FILE = os.path.join(DATA_PROCESSED_DIR, "detected_noise_samples.csv")
-    EMBEDDING_CACHE_FILE_BASE = os.path.join(PROXY_CACHE_DIR, "embeddings.npy")
-    EMBEDDING_CACHE_META_FILE_BASE = os.path.join(PROXY_CACHE_DIR, "embeddings_meta.csv")
-    PROXY_QUALITY_LOG_FILE = os.path.join(RESULTS_DIR, "proxy_ablation_table.csv")
-    FINAL_RESULTS_TABLE_FILE = os.path.join(RESULTS_DIR, "final_results_table.csv")
-    SIGNIFICANCE_TEST_FILE = os.path.join(RESULTS_DIR, "significance_test.csv")
-    PROGRESS_FILE = os.path.join(LOGS_DIR, "experiment_progress.json")
-
-    set_proxy(PROXY_ID, verbose=False)   # turunkan ulang path yang bergantung proxy
-    if verbose:
-        print(f"🧩 Split aktif: seed={SPLIT_SEED} ({'UTAMA' if not SPLIT_TAG else SPLIT_TAG}) | "
-              f"proxy [{PROXY_ID}] {PROXY_NAME}")
+    for s in split_seeds:
+        rp = RunPaths(s)
+        os.makedirs(rp.local_ckpt_dir, exist_ok=True)
+        os.makedirs(rp.local_cache_dir, exist_ok=True)
+    return dirs
 
 
-def require_primary_split(what):
-    if SPLIT_SEED != PRIMARY_SPLIT_SEED:
-        raise RuntimeError(
-            f"{what} hanya valid untuk split utama (seed {PRIMARY_SPLIT_SEED}); aktif: {SPLIT_SEED}. "
-            f"Jalankan config.set_split({PRIMARY_SPLIT_SEED})."
-        )
+def scenario_by_name(name):
+    for s in SCENARIOS:
+        if s["name"] == name:
+            return s
+    raise KeyError(name)
 
 
-set_split(PRIMARY_SPLIT_SEED, verbose=False)
-print(f"📌 Proxy aktif: [{PROXY_ID}] {PROXY_NAME} — {PROXY_DESC}")
+def get_device():
+    """Perangkat komputasi. Impor torch ditunda agar modul murni dapat diuji tanpa torch."""
+    import torch
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu")

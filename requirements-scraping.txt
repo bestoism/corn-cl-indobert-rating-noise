@@ -1,0 +1,5 @@
+# Hanya untuk scripts/scrape_google_play.py. Tidak dipakai oleh notebook final
+# karena scraping tidak boleh dijalankan ulang (korpus mentah terkunci).
+google-play-scraper
+py3langid
+pandas
